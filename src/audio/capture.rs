@@ -20,7 +20,8 @@ pub enum CaptureError {
 /// Shared buffer for audio samples.
 struct SharedBuffer {
     samples: Vec<f32>,
-    read_pos: usize,
+    /// Flag to indicate new samples are available.
+    new_data: bool,
 }
 
 /// Microphone capture using the system's default input device.
@@ -44,7 +45,7 @@ impl MicCapture {
 
         let buffer = Arc::new(Mutex::new(SharedBuffer {
             samples: Vec::with_capacity(sample_rate as usize), // 1 second buffer
-            read_pos: 0,
+            new_data: false,
         }));
 
         let buffer_clone = Arc::clone(&buffer);
@@ -90,13 +91,14 @@ impl MicCapture {
                     buf.samples.push(mono);
                 }
 
-                // Keep buffer at reasonable size (2 seconds max)
-                let max_samples = 88200; // 2 seconds at 44100
+                // Keep buffer at reasonable size (~0.5 second for pitch detection)
+                let max_samples = 22050;
                 if buf.samples.len() > max_samples {
                     let excess = buf.samples.len() - max_samples;
                     buf.samples.drain(0..excess);
-                    buf.read_pos = buf.read_pos.saturating_sub(excess);
                 }
+
+                buf.new_data = true;
             },
             |err| {
                 eprintln!("Audio capture error: {}", err);
@@ -124,13 +126,14 @@ impl MicCapture {
                     buf.samples.push(mono);
                 }
 
-                // Keep buffer at reasonable size (2 seconds max)
-                let max_samples = 88200; // 2 seconds at 44100
+                // Keep buffer at reasonable size (~0.5 second for pitch detection)
+                let max_samples = 22050;
                 if buf.samples.len() > max_samples {
                     let excess = buf.samples.len() - max_samples;
                     buf.samples.drain(0..excess);
-                    buf.read_pos = buf.read_pos.saturating_sub(excess);
                 }
+
+                buf.new_data = true;
             },
             |err| {
                 eprintln!("Audio capture error: {}", err);
@@ -144,14 +147,22 @@ impl AudioSource for MicCapture {
     fn read_samples(&mut self, buffer: &mut [f32]) -> usize {
         let mut buf = self.buffer.lock().unwrap();
 
-        let available = buf.samples.len() - buf.read_pos;
+        // Only return samples if we have new data
+        if !buf.new_data {
+            return 0;
+        }
+
+        // Copy the most recent samples (sliding window)
+        let available = buf.samples.len();
         let to_read = buffer.len().min(available);
 
         if to_read > 0 {
-            buffer[..to_read].copy_from_slice(&buf.samples[buf.read_pos..buf.read_pos + to_read]);
-            buf.read_pos += to_read;
+            // Copy from the end of the buffer (most recent samples)
+            let start = available - to_read;
+            buffer[..to_read].copy_from_slice(&buf.samples[start..]);
         }
 
+        buf.new_data = false;
         to_read
     }
 
