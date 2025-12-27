@@ -128,11 +128,7 @@ mod tests {
 
         // A4 should be close to 0
         let a4 = curve.offset_cents(69);
-        assert!(
-            a4.abs() < 3.0,
-            "A4 should be near 0 cents, got {}",
-            a4
-        );
+        assert!(a4.abs() < 3.0, "A4 should be near 0 cents, got {}", a4);
 
         // C4 should be close to 0
         let c4 = curve.offset_cents(60);
@@ -208,9 +204,17 @@ mod tests {
 
         // Verify approximate magnitudes match Railsback expectations
         let a0 = curve.offset_cents(21);
-        assert!(a0 >= -25.0 && a0 <= -10.0, "A0 stretch {} out of expected range", a0);
+        assert!(
+            a0 >= -25.0 && a0 <= -10.0,
+            "A0 stretch {} out of expected range",
+            a0
+        );
 
         let c8 = curve.offset_cents(108);
-        assert!(c8 >= 10.0 && c8 <= 25.0, "C8 stretch {} out of expected range", c8);
+        assert!(
+            c8 >= 10.0 && c8 <= 25.0,
+            "C8 stretch {} out of expected range",
+            c8
+        );
     }
 }

@@ -127,7 +127,11 @@ impl Widget for &CompleteScreen {
         let stats = [
             format!("Notes tuned: {}", self.completed_notes.len()),
             format!("Average deviation: {:.1} cents", self.avg_deviation),
-            format!("Duration: {}:{:02}", self.duration_secs / 60, self.duration_secs % 60),
+            format!(
+                "Duration: {}:{:02}",
+                self.duration_secs / 60,
+                self.duration_secs % 60
+            ),
         ];
 
         for (i, stat) in stats.iter().enumerate() {
@@ -179,11 +183,7 @@ impl Widget for &CompleteScreen {
         }
 
         // Help text
-        let help_text = format!(
-            "{} New session  {} Quit",
-            Shortcuts::ENTER,
-            Shortcuts::QUIT
-        );
+        let help_text = format!("{} New session  {} Quit", Shortcuts::ENTER, Shortcuts::QUIT);
         let help = Paragraph::new(help_text)
             .style(Theme::muted())
             .alignment(Alignment::Center);

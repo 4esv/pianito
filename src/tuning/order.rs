@@ -168,8 +168,7 @@ mod tests {
 
         // First 13 notes should be F3 through F4
         let expected_names = [
-            "F3", "F#3", "G3", "G#3", "A3", "A#3", "B3",
-            "C4", "C#4", "D4", "D#4", "E4", "F4",
+            "F3", "F#3", "G3", "G#3", "A3", "A#3", "B3", "C4", "C#4", "D4", "D#4", "E4", "F4",
         ];
 
         for (i, expected) in expected_names.iter().enumerate() {

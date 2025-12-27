@@ -50,8 +50,12 @@ impl MicCapture {
         let buffer_clone = Arc::clone(&buffer);
 
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => Self::build_stream_f32(&device, &config.into(), buffer_clone)?,
-            cpal::SampleFormat::I16 => Self::build_stream_i16(&device, &config.into(), buffer_clone)?,
+            cpal::SampleFormat::F32 => {
+                Self::build_stream_f32(&device, &config.into(), buffer_clone)?
+            }
+            cpal::SampleFormat::I16 => {
+                Self::build_stream_i16(&device, &config.into(), buffer_clone)?
+            }
             _ => {
                 return Err(CaptureError::BuildStreamError(
                     cpal::BuildStreamError::StreamConfigNotSupported,
@@ -115,7 +119,8 @@ impl MicCapture {
 
                 // Convert to mono f32 and append to buffer
                 for frame in data.chunks(channels) {
-                    let mono: f32 = frame.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / channels as f32;
+                    let mono: f32 =
+                        frame.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / channels as f32;
                     buf.samples.push(mono);
                 }
 
@@ -185,11 +190,7 @@ impl AudioOutput {
                 let mut buf = buffer_clone.lock().unwrap();
 
                 for frame in data.chunks_mut(channels) {
-                    let sample = if !buf.is_empty() {
-                        buf.remove(0)
-                    } else {
-                        0.0
-                    };
+                    let sample = if !buf.is_empty() { buf.remove(0) } else { 0.0 };
 
                     for s in frame.iter_mut() {
                         *s = sample;
@@ -220,5 +221,20 @@ impl AudioOutput {
     /// Get the sample rate.
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Play a sine wave at the given frequency for the given duration.
+    pub fn play_sine(&self, frequency: f32, duration: f32) -> anyhow::Result<()> {
+        let num_samples = (self.sample_rate as f32 * duration) as usize;
+        let mut samples = Vec::with_capacity(num_samples);
+
+        for i in 0..num_samples {
+            let t = i as f32 / self.sample_rate as f32;
+            let sample = 0.3 * (2.0 * std::f32::consts::PI * frequency * t).sin();
+            samples.push(sample);
+        }
+
+        self.queue(&samples);
+        Ok(())
     }
 }

@@ -6,8 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
-use crate::ui::components::{Instructions, Meter, Progress};
 use crate::ui::components::instructions::TuningStep;
+use crate::ui::components::{Instructions, Meter, Progress};
 use crate::ui::theme::{Shortcuts, Theme};
 
 /// Main tuning screen state.
@@ -148,12 +148,12 @@ impl Widget for &TuningScreen {
 
         // Layout
         let chunks = Layout::vertical([
-            Constraint::Length(2),  // Progress bar
-            Constraint::Length(1),  // Spacer
-            Constraint::Length(8),  // Meter
-            Constraint::Length(1),  // Spacer
-            Constraint::Min(6),     // Instructions
-            Constraint::Length(2),  // Help text
+            Constraint::Length(2), // Progress bar
+            Constraint::Length(1), // Spacer
+            Constraint::Length(8), // Meter
+            Constraint::Length(1), // Spacer
+            Constraint::Min(6),    // Instructions
+            Constraint::Length(2), // Help text
         ])
         .split(inner);
 
@@ -178,13 +178,12 @@ impl Widget for &TuningScreen {
         let instructions_area = chunks[4];
         if self.string_count == 3 {
             if let Some(step) = self.tuning_step {
-                let instructions = Instructions::trichord(step)
-                    .with_direction_hint(self.cents_deviation);
+                let instructions =
+                    Instructions::trichord(step).with_direction_hint(self.cents_deviation);
                 instructions.render(instructions_area, buf);
             }
         } else {
-            let instructions = Instructions::simple()
-                .with_direction_hint(self.cents_deviation);
+            let instructions = Instructions::simple().with_direction_hint(self.cents_deviation);
             instructions.render(instructions_area, buf);
         }
 

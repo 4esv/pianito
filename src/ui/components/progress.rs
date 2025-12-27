@@ -51,7 +51,10 @@ impl Widget for Progress {
         // Header line: note name and progress
         let header = format!(
             "{} | {}/{} | {}",
-            self.note_name, self.current + 1, self.total, self.phase_name
+            self.note_name,
+            self.current + 1,
+            self.total,
+            self.phase_name
         );
 
         let header_style = Theme::title();

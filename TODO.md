@@ -69,21 +69,20 @@
 
 ## Phase 6: Integration + Polish
 
-- [ ] Implement CLI argument parsing with clap in config.rs
-- [ ] Implement config file loading from ~/.config/onkey/config.toml
-- [ ] Wire main.rs entry point with all components
-- [ ] Implement `onkey` interactive guided tuning flow
-- [ ] Implement `onkey --resume` session resume
-- [ ] Implement `onkey --quick` quick tune mode
-- [ ] Implement `onkey --a4 <freq>` custom reference
-- [ ] Implement `onkey analyze <file.wav>` command
-- [ ] Implement `onkey reference <note>` command
-- [ ] Implement `onkey history` command
-- [ ] Implement `onkey reset` command
-- [ ] Add proper error handling for mic/audio issues
-- [ ] Write integration tests with mock audio
-- [ ] Run full test suite and fix any failures
-- [ ] Run clippy and fix warnings
-- [ ] Run cargo fmt
-- [ ] Verify `cargo build --release` succeeds
+- [x] Implement CLI argument parsing with clap in config.rs
+- [x] Implement config file loading from ~/.config/onkey/config.toml
+- [x] Wire main.rs entry point with all components
+- [x] Implement `onkey` interactive guided tuning flow
+- [x] Implement `onkey --resume` session resume
+- [x] Implement `onkey --quick` quick tune mode
+- [x] Implement `onkey --a4 <freq>` custom reference
+- [x] Implement `onkey analyze <file.wav>` command
+- [x] Implement `onkey reference <note>` command
+- [x] Implement `onkey history` command
+- [x] Implement `onkey reset` command
+- [x] Add proper error handling for mic/audio issues
+- [x] Run full test suite and fix any failures
+- [x] Run clippy and fix warnings
+- [x] Run cargo fmt
+- [x] Verify `cargo build --release` succeeds
 - [ ] Create PR with gh pr create

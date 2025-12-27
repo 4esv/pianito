@@ -182,8 +182,8 @@ mod tests {
     fn test_trichord_detection() {
         assert!(!Note::from_midi(21).unwrap().is_trichord()); // A0
         assert!(!Note::from_midi(35).unwrap().is_trichord()); // B1
-        assert!(Note::from_midi(48).unwrap().is_trichord());  // C3
-        assert!(Note::from_midi(69).unwrap().is_trichord());  // A4
+        assert!(Note::from_midi(48).unwrap().is_trichord()); // C3
+        assert!(Note::from_midi(69).unwrap().is_trichord()); // A4
     }
 
     #[test]
@@ -198,16 +198,32 @@ mod tests {
     fn test_chromatic_sequence() {
         // Check that notes follow chromatic order
         let expected_sequence = [
-            ("A", 0), ("A#", 0), ("B", 0),
-            ("C", 1), ("C#", 1), ("D", 1), ("D#", 1), ("E", 1), ("F", 1), ("F#", 1), ("G", 1), ("G#", 1),
-            ("A", 1), ("A#", 1), ("B", 1),
+            ("A", 0),
+            ("A#", 0),
+            ("B", 0),
+            ("C", 1),
+            ("C#", 1),
+            ("D", 1),
+            ("D#", 1),
+            ("E", 1),
+            ("F", 1),
+            ("F#", 1),
+            ("G", 1),
+            ("G#", 1),
+            ("A", 1),
+            ("A#", 1),
+            ("B", 1),
             ("C", 2),
         ];
 
         for (i, &(name, octave)) in expected_sequence.iter().enumerate() {
             let note = &NOTES[i];
             assert_eq!(note.name, name, "Note {} should be {}", i, name);
-            assert_eq!(note.octave, octave, "Note {} octave should be {}", i, octave);
+            assert_eq!(
+                note.octave, octave,
+                "Note {} octave should be {}",
+                i, octave
+            );
         }
     }
 }

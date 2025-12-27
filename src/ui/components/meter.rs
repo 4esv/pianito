@@ -1,10 +1,6 @@
 //! Cents deviation meter component.
 
-use ratatui::{
-    buffer::Buffer,
-    layout::Rect,
-    widgets::Widget,
-};
+use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
 
 use crate::ui::theme::{BoxChars, Theme};
 
@@ -81,7 +77,12 @@ impl Widget for Meter {
                 } else {
                     Theme::muted()
                 };
-                buf.set_string(x.saturating_sub(label.len() as u16 / 2), label_y, &label, style);
+                buf.set_string(
+                    x.saturating_sub(label.len() as u16 / 2),
+                    label_y,
+                    &label,
+                    style,
+                );
             }
         }
 

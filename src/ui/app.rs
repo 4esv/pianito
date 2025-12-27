@@ -3,13 +3,12 @@
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 
-use crate::tuning::session::{Session, TuningMode};
 use crate::tuning::order::TuningOrder;
+use crate::tuning::session::{Session, TuningMode};
 use crate::tuning::temperament::Temperament;
 
 use super::screens::{
-    CalibrationScreen, CompleteScreen, ModeSelectScreen, TuningScreen,
-    mode_select::SelectedMode,
+    mode_select::SelectedMode, CalibrationScreen, CompleteScreen, ModeSelectScreen, TuningScreen,
 };
 
 /// Application screen state.

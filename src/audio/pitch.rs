@@ -26,7 +26,7 @@ impl PitchDetector {
         Self {
             sample_rate,
             threshold: 0.1,
-            min_frequency: 27.5,  // A0
+            min_frequency: 27.5,   // A0
             max_frequency: 4186.0, // C8
         }
     }
@@ -52,7 +52,8 @@ impl PitchDetector {
 
         // Calculate tau range from frequency range
         let tau_min = (self.sample_rate as f32 / self.max_frequency) as usize;
-        let tau_max = (self.sample_rate as f32 / self.min_frequency).min((samples.len() / 2) as f32) as usize;
+        let tau_max =
+            (self.sample_rate as f32 / self.min_frequency).min((samples.len() / 2) as f32) as usize;
 
         if tau_max <= tau_min || tau_max >= samples.len() / 2 {
             return None;
@@ -123,7 +124,12 @@ impl PitchDetector {
     }
 
     /// Step 4: Find the first tau where cmnd drops below threshold.
-    fn find_threshold_crossing(&self, cmnd: &[f32], tau_min: usize, tau_max: usize) -> Option<usize> {
+    fn find_threshold_crossing(
+        &self,
+        cmnd: &[f32],
+        tau_min: usize,
+        tau_max: usize,
+    ) -> Option<usize> {
         // Find the first dip below threshold
         for tau in tau_min..tau_max {
             if cmnd[tau] < self.threshold {
@@ -204,15 +210,29 @@ mod tests {
     fn test_detect_a4_440hz() {
         let result = detect_frequency(440.0).expect("Should detect pitch");
         let error = (result.frequency - 440.0).abs();
-        assert!(error < 0.5, "Expected ~440Hz, got {} (error: {})", result.frequency, error);
-        assert!(result.confidence > 0.9, "Expected high confidence, got {}", result.confidence);
+        assert!(
+            error < 0.5,
+            "Expected ~440Hz, got {} (error: {})",
+            result.frequency,
+            error
+        );
+        assert!(
+            result.confidence > 0.9,
+            "Expected high confidence, got {}",
+            result.confidence
+        );
     }
 
     #[test]
     fn test_detect_a0_27_5hz() {
         let result = detect_frequency(27.5).expect("Should detect pitch");
         let error = (result.frequency - 27.5).abs();
-        assert!(error < 0.5, "Expected ~27.5Hz, got {} (error: {})", result.frequency, error);
+        assert!(
+            error < 0.5,
+            "Expected ~27.5Hz, got {} (error: {})",
+            result.frequency,
+            error
+        );
     }
 
     #[test]
@@ -220,14 +240,24 @@ mod tests {
         let result = detect_frequency(4186.0).expect("Should detect pitch");
         let error = (result.frequency - 4186.0).abs();
         // Higher frequencies have more absolute error due to sample rate limitations
-        assert!(error < 10.0, "Expected ~4186Hz, got {} (error: {})", result.frequency, error);
+        assert!(
+            error < 10.0,
+            "Expected ~4186Hz, got {} (error: {})",
+            result.frequency,
+            error
+        );
     }
 
     #[test]
     fn test_detect_middle_c_261hz() {
         let result = detect_frequency(261.63).expect("Should detect pitch");
         let error = (result.frequency - 261.63).abs();
-        assert!(error < 0.5, "Expected ~261.63Hz, got {} (error: {})", result.frequency, error);
+        assert!(
+            error < 0.5,
+            "Expected ~261.63Hz, got {} (error: {})",
+            result.frequency,
+            error
+        );
     }
 
     #[test]
@@ -240,10 +270,17 @@ mod tests {
             SAMPLE_RATE,
         );
         let detector = PitchDetector::new(SAMPLE_RATE);
-        let result = detector.detect(source.samples()).expect("Should detect pitch");
+        let result = detector
+            .detect(source.samples())
+            .expect("Should detect pitch");
 
         let error = (result.frequency - 440.0).abs();
-        assert!(error < 1.0, "Expected ~440Hz fundamental, got {} (error: {})", result.frequency, error);
+        assert!(
+            error < 1.0,
+            "Expected ~440Hz fundamental, got {} (error: {})",
+            result.frequency,
+            error
+        );
     }
 
     #[test]
@@ -276,7 +313,10 @@ mod tests {
 
         // Noise should either return None or the detector should reject it
         // due to the threshold (which results in None)
-        assert!(result.is_none(), "Noise should not produce a confident pitch detection");
+        assert!(
+            result.is_none(),
+            "Noise should not produce a confident pitch detection"
+        );
     }
 
     #[test]
@@ -297,8 +337,8 @@ mod tests {
         let test_freqs = [55.0, 110.0, 220.0, 440.0, 880.0, 1760.0, 3520.0];
 
         for &freq in &test_freqs {
-            let result = detect_frequency(freq)
-                .unwrap_or_else(|| panic!("Should detect {}Hz", freq));
+            let result =
+                detect_frequency(freq).unwrap_or_else(|| panic!("Should detect {}Hz", freq));
 
             let error = (result.frequency - freq).abs();
             let relative_error = error / freq;

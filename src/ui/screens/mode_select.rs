@@ -165,7 +165,12 @@ fn render_mode_option(mode: SelectedMode, is_selected: bool, area: Rect, buf: &m
 
     // Title line
     let title_line = format!("{}{}", prefix, mode.title());
-    buf.set_string(inner.x, inner.y, &title_line, title_style.add_modifier(Modifier::BOLD));
+    buf.set_string(
+        inner.x,
+        inner.y,
+        &title_line,
+        title_style.add_modifier(Modifier::BOLD),
+    );
 
     // Description (wrapped if needed)
     if inner.height >= 2 && inner.width > 4 {

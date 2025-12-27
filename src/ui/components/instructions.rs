@@ -126,7 +126,12 @@ impl Widget for Instructions {
         if self.is_trichord {
             if let Some(step) = &self.step {
                 // Step indicator
-                let step_text = format!("Step {} of {}: {}", step.number(), self.total_steps, step.title());
+                let step_text = format!(
+                    "Step {} of {}: {}",
+                    step.number(),
+                    self.total_steps,
+                    step.title()
+                );
                 let step_style = Theme::accent();
                 buf.set_string(inner.x + 1, y, &step_text, step_style);
                 y += 2;
