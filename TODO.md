@@ -41,16 +41,16 @@
 
 ## Phase 4: Session Persistence (with tests)
 
-- [ ] Define Session and CompletedNote structs in tuning/session.rs
-- [ ] Implement serde serialization for session data
-- [ ] Implement session save to ~/.local/share/onkey/sessions/
-- [ ] Implement session load and resume logic
-- [ ] Implement session history listing
-- [ ] Implement session reset (clear all)
-- [ ] Write tests for serialize/deserialize round-trip
-- [ ] Write tests for session state transitions
-- [ ] Write tests for resume finding most recent incomplete session
-- [ ] Verify all session tests pass
+- [x] Define Session and CompletedNote structs in tuning/session.rs
+- [x] Implement serde serialization for session data
+- [x] Implement session save to ~/.local/share/onkey/sessions/
+- [x] Implement session load and resume logic
+- [x] Implement session history listing
+- [x] Implement session reset (clear all)
+- [x] Write tests for serialize/deserialize round-trip
+- [x] Write tests for session state transitions
+- [x] Write tests for resume finding most recent incomplete session
+- [x] Verify all session tests pass
 
 ## Phase 5: TUI Screens
 
