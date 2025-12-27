@@ -54,18 +54,18 @@
 
 ## Phase 5: TUI Screens
 
-- [ ] Set up ratatui with crossterm backend in ui/mod.rs
-- [ ] Define color theme and box-drawing constants in ui/theme.rs
-- [ ] Implement cents deviation meter component in ui/components/meter.rs
-- [ ] Implement coaching instructions component in ui/components/instructions.rs
-- [ ] Implement progress indicator component in ui/components/progress.rs
-- [ ] Implement mode select screen in ui/screens/mode_select.rs
-- [ ] Implement calibration screen in ui/screens/calibration.rs
-- [ ] Implement main tuning screen in ui/screens/tuning.rs
-- [ ] Implement complete/summary screen in ui/screens/complete.rs
-- [ ] Implement app state machine in ui/app.rs
-- [ ] Wire up keyboard input handling (Space, R, S, Q)
-- [ ] Verify TUI renders correctly
+- [x] Set up ratatui with crossterm backend in ui/mod.rs
+- [x] Define color theme and box-drawing constants in ui/theme.rs
+- [x] Implement cents deviation meter component in ui/components/meter.rs
+- [x] Implement coaching instructions component in ui/components/instructions.rs
+- [x] Implement progress indicator component in ui/components/progress.rs
+- [x] Implement mode select screen in ui/screens/mode_select.rs
+- [x] Implement calibration screen in ui/screens/calibration.rs
+- [x] Implement main tuning screen in ui/screens/tuning.rs
+- [x] Implement complete/summary screen in ui/screens/complete.rs
+- [x] Implement app state machine in ui/app.rs
+- [x] Wire up keyboard input handling (Space, R, S, Q)
+- [x] Verify TUI renders correctly
 
 ## Phase 6: Integration + Polish
 
