@@ -26,18 +26,18 @@
 
 ## Phase 3: Tuning Logic + Temperament Math (with tests)
 
-- [ ] Define Note struct and 88-key note definitions in tuning/notes.rs
-- [ ] Implement frequency calculation for equal temperament in tuning/temperament.rs
-- [ ] Implement cents-to-frequency and frequency-to-cents conversion
-- [ ] Implement custom A4 reference support
-- [ ] Implement Railsback stretch curve in tuning/stretch.rs
-- [ ] Implement tuning order logic in tuning/order.rs (temperament-first)
-- [ ] Write tests for all 88 note frequencies at A4=440Hz
-- [ ] Write tests for custom A4 (442Hz)
-- [ ] Write tests for cents conversion round-trip
-- [ ] Write tests for stretch curve values
-- [ ] Write tests for tuning order (F3-F4 first, then up, then down)
-- [ ] Verify all tuning tests pass
+- [x] Define Note struct and 88-key note definitions in tuning/notes.rs
+- [x] Implement frequency calculation for equal temperament in tuning/temperament.rs
+- [x] Implement cents-to-frequency and frequency-to-cents conversion
+- [x] Implement custom A4 reference support
+- [x] Implement Railsback stretch curve in tuning/stretch.rs
+- [x] Implement tuning order logic in tuning/order.rs (temperament-first)
+- [x] Write tests for all 88 note frequencies at A4=440Hz
+- [x] Write tests for custom A4 (442Hz)
+- [x] Write tests for cents conversion round-trip
+- [x] Write tests for stretch curve values
+- [x] Write tests for tuning order (F3-F4 first, then up, then down)
+- [x] Verify all tuning tests pass
 
 ## Phase 4: Session Persistence (with tests)
 
