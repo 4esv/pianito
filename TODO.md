@@ -12,17 +12,17 @@
 
 ## Phase 2: Audio Capture + Pitch Detection (with tests)
 
-- [ ] Implement AudioSource and AudioSink traits in audio/traits.rs
-- [ ] Implement TestAudioSource for mocking in tests
-- [ ] Implement WavAudioSource for reading WAV files
-- [ ] Implement mic capture with cpal in audio/capture.rs
-- [ ] Implement sine wave generation in audio/reference.rs
-- [ ] Implement YIN pitch detection algorithm in audio/pitch.rs
-- [ ] Create synthetic test fixtures generator (build script or test helper)
-- [ ] Write tests for pitch detection with synthetic sine waves
-- [ ] Write tests for pitch detection with harmonics
-- [ ] Write tests for confidence threshold rejection
-- [ ] Verify all audio tests pass
+- [x] Implement AudioSource and AudioSink traits in audio/traits.rs
+- [x] Implement TestAudioSource for mocking in tests
+- [x] Implement WavAudioSource for reading WAV files
+- [x] Implement mic capture with cpal in audio/capture.rs
+- [x] Implement sine wave generation in audio/reference.rs
+- [x] Implement YIN pitch detection algorithm in audio/pitch.rs
+- [x] Create synthetic test fixtures generator (build script or test helper)
+- [x] Write tests for pitch detection with synthetic sine waves
+- [x] Write tests for pitch detection with harmonics
+- [x] Write tests for confidence threshold rejection
+- [x] Verify all audio tests pass
 
 ## Phase 3: Tuning Logic + Temperament Math (with tests)
 
