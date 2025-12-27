@@ -85,4 +85,4 @@
 - [x] Run clippy and fix warnings
 - [x] Run cargo fmt
 - [x] Verify `cargo build --release` succeeds
-- [ ] Create PR with gh pr create
+- [x] Push changes to main
