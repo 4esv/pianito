@@ -163,7 +163,7 @@ impl TuningScreen {
                     && self.detected_freq.is_some()
             }
             2 => {
-                self.tuning_step == Some(TuningStep::TuneBichordRight)
+                self.tuning_step == Some(TuningStep::TuneBichord)
                     && self.cents_deviation.abs() <= 5.0
                     && self.detected_freq.is_some()
             }
@@ -201,10 +201,7 @@ impl Widget for &TuningScreen {
         }
 
         // Check if we're in muting step (don't show meter or hints)
-        let is_muting_step = self
-            .tuning_step
-            .map(|s| s.is_muting())
-            .unwrap_or(false);
+        let is_muting_step = self.tuning_step.map(|s| s.is_muting()).unwrap_or(false);
 
         // Layout - piano at top, instructions, then meter
         let chunks = Layout::vertical([
@@ -228,11 +225,13 @@ impl Widget for &TuningScreen {
         );
         progress.render(chunks[0], buf);
 
-        // Piano visualization (uses chromatic index, not tuning order)
+        // Piano visualization (full 88-key piano, A0=MIDI 21)
         let piano = if self.show_piano_progress {
-            Piano::new(self.chromatic_index).with_progress(self.completed_notes.clone())
+            Piano::full()
+                .highlighted(self.completed_notes.clone())
+                .current(Some(self.chromatic_index))
         } else {
-            Piano::new(self.chromatic_index)
+            Piano::full().current(Some(self.chromatic_index))
         };
         piano.render(chunks[2], buf);
 
