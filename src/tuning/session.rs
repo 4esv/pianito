@@ -7,19 +7,14 @@ use std::fs;
 use std::path::PathBuf;
 
 /// Tuning mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TuningMode {
     /// Quick tune relative to current pitch center.
     Quick,
     /// Concert pitch tuning (A4 = 440Hz or custom).
+    #[default]
     Concert,
-}
-
-impl Default for TuningMode {
-    fn default() -> Self {
-        Self::Concert
-    }
 }
 
 /// A completed note in a tuning session.
