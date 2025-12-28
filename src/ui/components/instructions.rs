@@ -13,10 +13,10 @@ use crate::ui::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuningStep {
     // Bichord (2 strings) - 2 steps
-    /// Tune left string to pitch (mute right first).
-    TuneBichordLeft,
-    /// Tune right string to unison with left.
-    TuneBichordRight,
+    /// Mute the right string.
+    MuteBichord,
+    /// Tune left string to pitch, then right to match.
+    TuneBichord,
 
     // Trichord (3 strings) - 4 steps
     /// Mute outer strings.
@@ -33,7 +33,7 @@ impl TuningStep {
     /// Create first step for given string count.
     pub fn first_for_strings(strings: u8) -> Option<Self> {
         match strings {
-            2 => Some(Self::TuneBichordLeft),
+            2 => Some(Self::MuteBichord),
             3 => Some(Self::MuteOuter),
             _ => None, // Monochord has no steps
         }
@@ -41,13 +41,13 @@ impl TuningStep {
 
     /// Check if this is a muting step (no tuning hints).
     pub fn is_muting(&self) -> bool {
-        matches!(self, Self::MuteOuter)
+        matches!(self, Self::MuteBichord | Self::MuteOuter)
     }
 
     /// Get total steps for this string type.
     pub fn total_steps(&self) -> u8 {
         match self {
-            Self::TuneBichordLeft | Self::TuneBichordRight => 2,
+            Self::MuteBichord | Self::TuneBichord => 2,
             Self::MuteOuter | Self::TuneCenter | Self::TuneLeft | Self::TuneRight => 4,
         }
     }
@@ -55,8 +55,8 @@ impl TuningStep {
     /// Get step number (1-based).
     pub fn number(&self) -> u8 {
         match self {
-            Self::TuneBichordLeft => 1,
-            Self::TuneBichordRight => 2,
+            Self::MuteBichord => 1,
+            Self::TuneBichord => 2,
             Self::MuteOuter => 1,
             Self::TuneCenter => 2,
             Self::TuneLeft => 3,
@@ -67,8 +67,8 @@ impl TuningStep {
     /// Get the step title.
     pub fn title(&self) -> &'static str {
         match self {
-            Self::TuneBichordLeft => "Tune left string",
-            Self::TuneBichordRight => "Tune right string",
+            Self::MuteBichord => "Mute right string",
+            Self::TuneBichord => "Tune left string",
             Self::MuteOuter => "Mute outer strings",
             Self::TuneCenter => "Tune center string",
             Self::TuneLeft => "Tune left string",
@@ -79,8 +79,8 @@ impl TuningStep {
     /// Get instruction text.
     pub fn instruction(&self) -> &'static str {
         match self {
-            Self::TuneBichordLeft => "Mute the right string. Tune the left string to the target pitch using the meter.",
-            Self::TuneBichordRight => "Unmute the right string. Tune it to match the left until you hear no beats.",
+            Self::MuteBichord => "Use a felt wedge or rubber mute to mute the right string. Only the left string should sound.",
+            Self::TuneBichord => "Tune the left string to pitch. Then remove the mute and tune the right string to match.",
             Self::MuteOuter => "Use felt strip or rubber mutes to mute the outer strings. Only the center string should sound.",
             Self::TuneCenter => "Tune the center string to the target pitch using the meter.",
             Self::TuneLeft => "Unmute the left string. Tune it to match the center string until you hear no beats.",
@@ -91,8 +91,8 @@ impl TuningStep {
     /// Get the next step.
     pub fn next(&self) -> Option<Self> {
         match self {
-            Self::TuneBichordLeft => Some(Self::TuneBichordRight),
-            Self::TuneBichordRight => None,
+            Self::MuteBichord => Some(Self::TuneBichord),
+            Self::TuneBichord => None,
             Self::MuteOuter => Some(Self::TuneCenter),
             Self::TuneCenter => Some(Self::TuneLeft),
             Self::TuneLeft => Some(Self::TuneRight),
@@ -103,8 +103,8 @@ impl TuningStep {
     /// Get the previous step.
     pub fn prev(&self) -> Option<Self> {
         match self {
-            Self::TuneBichordLeft => None,
-            Self::TuneBichordRight => Some(Self::TuneBichordLeft),
+            Self::MuteBichord => None,
+            Self::TuneBichord => Some(Self::MuteBichord),
             Self::MuteOuter => None,
             Self::TuneCenter => Some(Self::MuteOuter),
             Self::TuneLeft => Some(Self::TuneCenter),
@@ -211,7 +211,12 @@ impl Widget for Instructions {
         // Press SPACE prompt
         if y + 1 < inner.y + inner.height {
             let prompt = "Press SPACE to continue";
-            buf.set_string(inner.x + 1, inner.y + inner.height - 1, prompt, Theme::muted());
+            buf.set_string(
+                inner.x + 1,
+                inner.y + inner.height - 1,
+                prompt,
+                Theme::muted(),
+            );
         }
     }
 }
