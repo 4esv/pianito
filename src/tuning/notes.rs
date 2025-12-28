@@ -36,7 +36,7 @@ impl Note {
 
     /// Get note by MIDI number.
     pub fn from_midi(midi: u8) -> Option<&'static Note> {
-        if midi < 21 || midi > 108 {
+        if !(21..=108).contains(&midi) {
             return None;
         }
         NOTES.get((midi - 21) as usize)
@@ -57,10 +57,9 @@ const NOTE_NAMES: [&str; 12] = [
 /// Piano range: A0 (MIDI 21) to C8 (MIDI 108)
 ///
 /// String counts:
-/// - A0 to B0 (MIDI 21-23): 1 string (bass)
-/// - C1 to B1 (MIDI 24-35): 2 strings (bass/tenor)
-/// - C2 to B2 (MIDI 36-47): 2 strings (tenor)
-/// - C3 to C8 (MIDI 48-108): 3 strings (trichords)
+/// - A0 to Bb1 (MIDI 21-34): 1 string (monochord)
+/// - B1 to G#3 (MIDI 35-56): 2 strings (bichord)
+/// - A3 to C8 (MIDI 57-108): 3 strings (trichord)
 const fn generate_notes() -> [Note; 88] {
     let mut notes = [Note::new(0, "", 0, 0); 88];
     let mut i = 0;
@@ -81,12 +80,13 @@ const fn generate_notes() -> [Note; 88] {
         let note_idx = semitones_from_a0 % 12;
 
         // Determine string count
-        let strings = if midi <= 23 {
-            1 // A0-B0: single string
-        } else if midi <= 47 {
-            2 // C1-B2: bichord
+        // Bb1 (A#1) = MIDI 34, B1 = MIDI 35, A3 = MIDI 57
+        let strings = if midi <= 34 {
+            1 // A0-Bb1: monochord
+        } else if midi <= 56 {
+            2 // B1-G#3: bichord
         } else {
-            3 // C3-C8: trichord
+            3 // A3-C8: trichord
         };
 
         notes[i] = Note::new(midi, NOTE_NAMES[note_idx], octave, strings);
@@ -156,16 +156,16 @@ mod tests {
 
     #[test]
     fn test_string_counts() {
-        // Single string: A0-B0
+        // Monochord: A0-Bb1 (MIDI 21-34)
         assert_eq!(Note::from_midi(21).unwrap().strings, 1); // A0
-        assert_eq!(Note::from_midi(23).unwrap().strings, 1); // B0
+        assert_eq!(Note::from_midi(34).unwrap().strings, 1); // Bb1 (A#1)
 
-        // Bichord: C1-B2
-        assert_eq!(Note::from_midi(24).unwrap().strings, 2); // C1
-        assert_eq!(Note::from_midi(47).unwrap().strings, 2); // B2
+        // Bichord: B1-G#3 (MIDI 35-56)
+        assert_eq!(Note::from_midi(35).unwrap().strings, 2); // B1
+        assert_eq!(Note::from_midi(56).unwrap().strings, 2); // G#3
 
-        // Trichord: C3-C8
-        assert_eq!(Note::from_midi(48).unwrap().strings, 3); // C3
+        // Trichord: A3-C8 (MIDI 57-108)
+        assert_eq!(Note::from_midi(57).unwrap().strings, 3); // A3
         assert_eq!(Note::from_midi(108).unwrap().strings, 3); // C8
     }
 
@@ -180,10 +180,11 @@ mod tests {
 
     #[test]
     fn test_trichord_detection() {
-        assert!(!Note::from_midi(21).unwrap().is_trichord()); // A0
-        assert!(!Note::from_midi(35).unwrap().is_trichord()); // B1
-        assert!(Note::from_midi(48).unwrap().is_trichord()); // C3
-        assert!(Note::from_midi(69).unwrap().is_trichord()); // A4
+        assert!(!Note::from_midi(21).unwrap().is_trichord()); // A0 (monochord)
+        assert!(!Note::from_midi(35).unwrap().is_trichord()); // B1 (bichord)
+        assert!(!Note::from_midi(56).unwrap().is_trichord()); // G#3 (bichord)
+        assert!(Note::from_midi(57).unwrap().is_trichord()); // A3 (trichord)
+        assert!(Note::from_midi(69).unwrap().is_trichord()); // A4 (trichord)
     }
 
     #[test]

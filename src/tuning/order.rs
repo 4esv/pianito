@@ -87,7 +87,7 @@ impl TuningOrder {
 
     /// Find the position of a note in the tuning order.
     pub fn position_of(&self, midi: u8) -> Option<usize> {
-        if midi < A0_MIDI || midi > C8_MIDI {
+        if !(A0_MIDI..=C8_MIDI).contains(&midi) {
             return None;
         }
         let note_index = (midi - A0_MIDI) as usize;
@@ -101,7 +101,7 @@ impl TuningOrder {
 
     /// Check if we're in the upward phase.
     pub fn is_upward_phase(&self, position: usize) -> bool {
-        position >= 13 && position < 13 + 43 // F#4 to C8 is 43 notes
+        (13..13 + 43).contains(&position) // F#4 to C8 is 43 notes
     }
 
     /// Check if we're in the downward phase.

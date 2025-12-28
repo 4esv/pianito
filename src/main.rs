@@ -214,9 +214,6 @@ fn run_interactive(config: onkey::config::EffectiveConfig) -> anyhow::Result<()>
     // Initialize terminal
     let mut terminal = ui::init()?;
 
-    // Audio output for reference tones
-    let audio_output = AudioOutput::new().ok();
-
     // Main loop
     let mut audio_buffer = vec![0.0f32; sample_rate as usize / 10]; // 100ms buffer
 
@@ -228,14 +225,6 @@ fn run_interactive(config: onkey::config::EffectiveConfig) -> anyhow::Result<()>
                 app.update_pitch(pitch_result.frequency, pitch_result.confidence);
             } else {
                 app.clear_pitch();
-            }
-        }
-
-        // Handle reference tone
-        if app.is_playing_reference() {
-            if let (Some(ref output), Some(freq)) = (&audio_output, app.current_target_freq()) {
-                // Play short burst of reference tone
-                let _ = output.play_sine(freq, 0.1);
             }
         }
 

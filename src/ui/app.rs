@@ -1,5 +1,7 @@
 //! Main application state machine.
 
+use std::collections::HashSet;
+
 use crossterm::event::KeyCode;
 use ratatui::Frame;
 
@@ -46,8 +48,6 @@ pub struct App {
     temperament: Temperament,
     /// Current note index in tuning order.
     current_note_idx: usize,
-    /// Whether reference tone is playing.
-    playing_reference: bool,
 }
 
 impl App {
@@ -64,7 +64,6 @@ impl App {
             tuning_order: TuningOrder::new(),
             temperament: Temperament::new(),
             current_note_idx: 0,
-            playing_reference: false,
         }
     }
 
@@ -102,11 +101,6 @@ impl App {
     /// Get mutable session.
     pub fn session_mut(&mut self) -> Option<&mut Session> {
         self.session.as_mut()
-    }
-
-    /// Check if reference tone is playing.
-    pub fn is_playing_reference(&self) -> bool {
-        self.playing_reference
     }
 
     /// Get target frequency for current note.
@@ -159,9 +153,13 @@ impl App {
                 // Confirm current note/step
                 self.confirm_note();
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                // Toggle reference tone
-                self.playing_reference = !self.playing_reference;
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                // Go back to previous step or note
+                self.go_back();
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                // Toggle piano progress display
+                self.toggle_piano_progress();
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 // Skip current note
@@ -175,6 +173,13 @@ impl App {
                 self.quit();
             }
             _ => {}
+        }
+    }
+
+    /// Toggle piano progress display.
+    fn toggle_piano_progress(&mut self) {
+        if let Some(tuning) = &mut self.tuning {
+            tuning.toggle_piano_progress();
         }
     }
 
@@ -233,13 +238,31 @@ impl App {
         if let Some(note) = self.tuning_order.note_at(self.current_note_idx) {
             let target_freq = self.temperament.frequency(note.midi);
 
-            self.tuning = Some(TuningScreen::new(
+            // Collect completed chromatic indices from session (midi - 21)
+            let completed_notes: HashSet<usize> = if let Some(session) = &self.session {
+                session
+                    .completed_notes
+                    .iter()
+                    .filter_map(|cn| {
+                        // Look up note by name to get its midi, then convert to chromatic index
+                        crate::tuning::notes::Note::from_name(&cn.note)
+                            .map(|n| (n.midi - 21) as usize)
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+
+            let mut tuning = TuningScreen::new(
                 note.display_name(),
                 self.current_note_idx,
                 88,
                 target_freq,
                 note.strings,
-            ));
+                note.midi,
+            );
+            tuning.set_completed_notes(completed_notes);
+            self.tuning = Some(tuning);
         }
     }
 
@@ -290,8 +313,8 @@ impl App {
     /// Confirm current note is tuned.
     fn confirm_note(&mut self) {
         if let Some(tuning) = &mut self.tuning {
-            // For trichords, advance through steps
-            if tuning.is_trichord() && tuning.next_step() {
+            // For multi-string notes (bichord/trichord), advance through steps
+            if tuning.is_multi_string() && tuning.next_step() {
                 return;
             }
 
@@ -303,6 +326,32 @@ impl App {
             }
 
             self.advance_to_next_note();
+        }
+    }
+
+    /// Go back to previous step or previous note.
+    fn go_back(&mut self) {
+        // Try to go to previous step first
+        if let Some(tuning) = &mut self.tuning {
+            if tuning.prev_step() {
+                return;
+            }
+        }
+
+        // Otherwise go to previous note
+        if self.current_note_idx > 0 {
+            self.current_note_idx -= 1;
+            self.setup_current_note();
+
+            // For multi-string notes, go to last step
+            if let Some(tuning) = &mut self.tuning {
+                while tuning.next_step() {}
+            }
+
+            // Update session
+            if let Some(session) = &mut self.session {
+                session.current_note_index = self.current_note_idx;
+            }
         }
     }
 
@@ -321,7 +370,6 @@ impl App {
     /// Advance to the next note.
     fn advance_to_next_note(&mut self) {
         self.current_note_idx += 1;
-        self.playing_reference = false;
 
         if self.current_note_idx >= 88 {
             self.finish_session();
@@ -354,7 +402,6 @@ impl App {
         self.tuning = None;
         self.complete = None;
         self.current_note_idx = 0;
-        self.playing_reference = false;
         self.mode_select = ModeSelectScreen::new();
         self.calibration = CalibrationScreen::new();
     }

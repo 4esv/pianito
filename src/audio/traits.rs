@@ -153,20 +153,16 @@ impl<R: Read + Seek + Send> AudioSource for WavAudioSource<R> {
 
         match spec.sample_format {
             hound::SampleFormat::Float => {
-                for sample in self.reader.samples::<f32>().take(buffer.len()) {
-                    if let Ok(s) = sample {
-                        buffer[count] = s;
-                        count += 1;
-                    }
+                for s in self.reader.samples::<f32>().take(buffer.len()).flatten() {
+                    buffer[count] = s;
+                    count += 1;
                 }
             }
             hound::SampleFormat::Int => {
                 let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                for sample in self.reader.samples::<i32>().take(buffer.len()) {
-                    if let Ok(s) = sample {
-                        buffer[count] = s as f32 / max_val;
-                        count += 1;
-                    }
+                for s in self.reader.samples::<i32>().take(buffer.len()).flatten() {
+                    buffer[count] = s as f32 / max_val;
+                    count += 1;
                 }
             }
         }

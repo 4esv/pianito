@@ -27,7 +27,7 @@ impl StretchCurve {
     /// Get the stretch offset in cents for a given MIDI note.
     /// Positive values = tune sharp, negative = tune flat.
     pub fn offset_cents(&self, midi_note: u8) -> f32 {
-        if midi_note < 21 || midi_note > 108 {
+        if !(21..=108).contains(&midi_note) {
             return 0.0;
         }
         self.offsets[(midi_note - 21) as usize]
@@ -47,9 +47,9 @@ impl StretchCurve {
     fn generate_railsback_curve() -> [f32; 88] {
         let mut offsets = [0.0_f32; 88];
 
-        for i in 0..88 {
+        for (i, offset) in offsets.iter_mut().enumerate() {
             let midi = (i + 21) as u8;
-            offsets[i] = Self::calculate_stretch(midi);
+            *offset = Self::calculate_stretch(midi);
         }
 
         offsets
@@ -74,9 +74,7 @@ impl StretchCurve {
         // - x = -0.89 (A0): stretch ≈ -20
         // - x = 0 (C4): stretch ≈ 0
         // - x = 1.09 (C8): stretch ≈ +20
-        let stretch = 20.0 * x * x * x.signum();
-
-        stretch
+        20.0 * x * x * x.signum()
     }
 
     /// Apply stretch to a base frequency.

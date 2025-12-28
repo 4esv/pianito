@@ -137,6 +137,7 @@ impl PitchDetector {
                 let mut min_tau = tau;
                 let mut min_val = cmnd[tau];
 
+                #[allow(clippy::needless_range_loop)]
                 for t in tau + 1..tau_max {
                     if cmnd[t] < min_val {
                         min_val = cmnd[t];
@@ -155,6 +156,7 @@ impl PitchDetector {
         let mut min_tau = tau_min;
         let mut min_val = cmnd[tau_min];
 
+        #[allow(clippy::needless_range_loop)]
         for tau in tau_min + 1..tau_max {
             if cmnd[tau] < min_val {
                 min_val = cmnd[tau];

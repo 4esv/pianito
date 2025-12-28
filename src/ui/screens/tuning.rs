@@ -1,5 +1,7 @@
 //! Main tuning screen.
 
+use std::collections::HashSet;
+
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -7,7 +9,7 @@ use ratatui::{
 };
 
 use crate::ui::components::instructions::TuningStep;
-use crate::ui::components::{Instructions, Meter, Progress};
+use crate::ui::components::{Instructions, Meter, Piano, Progress};
 use crate::ui::theme::{Shortcuts, Theme};
 
 /// Main tuning screen state.
@@ -16,6 +18,8 @@ pub struct TuningScreen {
     note_name: String,
     /// Current note index in tuning order.
     note_index: usize,
+    /// Chromatic note index (0=A0, 87=C8) for piano display.
+    chromatic_index: usize,
     /// Total notes to tune.
     total_notes: usize,
     /// Target frequency in Hz.
@@ -26,10 +30,14 @@ pub struct TuningScreen {
     cents_deviation: f32,
     /// Number of strings for this note.
     string_count: u8,
-    /// Current tuning step (for trichords).
+    /// Current tuning step (for multi-string notes).
     tuning_step: Option<TuningStep>,
     /// Phase name for display.
     phase_name: String,
+    /// Whether to show piano progress view.
+    show_piano_progress: bool,
+    /// Set of completed chromatic indices.
+    completed_notes: HashSet<usize>,
 }
 
 impl TuningScreen {
@@ -40,12 +48,10 @@ impl TuningScreen {
         total_notes: usize,
         target_freq: f32,
         string_count: u8,
+        midi: u8,
     ) -> Self {
-        let tuning_step = if string_count == 3 {
-            Some(TuningStep::MuteOuter)
-        } else {
-            None
-        };
+        // Use first_for_strings to get the starting step for bi/trichord notes
+        let tuning_step = TuningStep::first_for_strings(string_count);
 
         let phase_name = if string_count == 3 {
             "Trichord".to_string()
@@ -55,9 +61,13 @@ impl TuningScreen {
             "Single".to_string()
         };
 
+        // Chromatic index: 0=A0 (MIDI 21), 87=C8 (MIDI 108)
+        let chromatic_index = (midi - 21) as usize;
+
         Self {
             note_name: note_name.into(),
             note_index,
+            chromatic_index,
             total_notes,
             target_freq,
             detected_freq: None,
@@ -65,7 +75,24 @@ impl TuningScreen {
             string_count,
             tuning_step,
             phase_name,
+            show_piano_progress: false,
+            completed_notes: HashSet::new(),
         }
+    }
+
+    /// Toggle piano progress display.
+    pub fn toggle_piano_progress(&mut self) {
+        self.show_piano_progress = !self.show_piano_progress;
+    }
+
+    /// Set the completed notes for progress display.
+    pub fn set_completed_notes(&mut self, completed: HashSet<usize>) {
+        self.completed_notes = completed;
+    }
+
+    /// Get note index.
+    pub fn note_index(&self) -> usize {
+        self.note_index
     }
 
     /// Update with detected pitch.
@@ -90,12 +117,22 @@ impl TuningScreen {
         self.string_count == 3
     }
 
+    /// Check if this is a bichord note.
+    pub fn is_bichord(&self) -> bool {
+        self.string_count == 2
+    }
+
+    /// Check if this note has multiple strings (bichord or trichord).
+    pub fn is_multi_string(&self) -> bool {
+        self.string_count >= 2
+    }
+
     /// Get current tuning step.
     pub fn tuning_step(&self) -> Option<TuningStep> {
         self.tuning_step
     }
 
-    /// Advance to next tuning step (for trichords).
+    /// Advance to next tuning step (for multi-string notes).
     pub fn next_step(&mut self) -> bool {
         if let Some(step) = &self.tuning_step {
             if let Some(next) = step.next() {
@@ -106,14 +143,31 @@ impl TuningScreen {
         false
     }
 
+    /// Go back to previous tuning step.
+    pub fn prev_step(&mut self) -> bool {
+        if let Some(step) = &self.tuning_step {
+            if let Some(prev) = step.prev() {
+                self.tuning_step = Some(prev);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if note tuning is complete.
     pub fn is_complete(&self) -> bool {
-        if self.string_count == 3 {
-            self.tuning_step == Some(TuningStep::TuneRight)
-                && self.cents_deviation.abs() <= 5.0
-                && self.detected_freq.is_some()
-        } else {
-            self.cents_deviation.abs() <= 5.0 && self.detected_freq.is_some()
+        match self.string_count {
+            3 => {
+                self.tuning_step == Some(TuningStep::TuneRight)
+                    && self.cents_deviation.abs() <= 5.0
+                    && self.detected_freq.is_some()
+            }
+            2 => {
+                self.tuning_step == Some(TuningStep::TuneBichordRight)
+                    && self.cents_deviation.abs() <= 5.0
+                    && self.detected_freq.is_some()
+            }
+            _ => self.cents_deviation.abs() <= 5.0 && self.detected_freq.is_some(),
         }
     }
 
@@ -146,13 +200,21 @@ impl Widget for &TuningScreen {
             return;
         }
 
-        // Layout
+        // Check if we're in muting step (don't show meter or hints)
+        let is_muting_step = self
+            .tuning_step
+            .map(|s| s.is_muting())
+            .unwrap_or(false);
+
+        // Layout - piano at top, instructions, then meter
         let chunks = Layout::vertical([
             Constraint::Length(2), // Progress bar
             Constraint::Length(1), // Spacer
-            Constraint::Length(8), // Meter
+            Constraint::Length(4), // Piano visualization
             Constraint::Length(1), // Spacer
             Constraint::Min(6),    // Instructions
+            Constraint::Length(1), // Spacer
+            Constraint::Length(8), // Meter (hidden during muting)
             Constraint::Length(2), // Help text
         ])
         .split(inner);
@@ -166,38 +228,54 @@ impl Widget for &TuningScreen {
         );
         progress.render(chunks[0], buf);
 
-        // Cents meter
-        let meter = if self.detected_freq.is_some() {
-            Meter::new(self.cents_deviation)
+        // Piano visualization (uses chromatic index, not tuning order)
+        let piano = if self.show_piano_progress {
+            Piano::new(self.chromatic_index).with_progress(self.completed_notes.clone())
         } else {
-            Meter::listening()
+            Piano::new(self.chromatic_index)
         };
-        meter.render(chunks[2], buf);
+        piano.render(chunks[2], buf);
 
         // Instructions panel
         let instructions_area = chunks[4];
-        if self.string_count == 3 {
-            if let Some(step) = self.tuning_step {
-                let instructions =
-                    Instructions::trichord(step).with_direction_hint(self.cents_deviation);
-                instructions.render(instructions_area, buf);
-            }
+        if let Some(step) = self.tuning_step {
+            // Multi-string note (bichord or trichord)
+            let instructions = if is_muting_step {
+                // Don't show direction hints during muting
+                Instructions::for_step(step, self.string_count)
+            } else {
+                Instructions::for_step(step, self.string_count)
+                    .with_direction_hint(self.cents_deviation)
+            };
+            instructions.render(instructions_area, buf);
         } else {
+            // Monochord note - simple instruction
             let instructions = Instructions::simple().with_direction_hint(self.cents_deviation);
             instructions.render(instructions_area, buf);
         }
 
+        // Cents meter (hidden during muting step)
+        if !is_muting_step {
+            let meter = if self.detected_freq.is_some() {
+                Meter::new(self.cents_deviation)
+            } else {
+                Meter::listening()
+            };
+            meter.render(chunks[6], buf);
+        }
+
         // Help text
         let help_text = format!(
-            "{} Confirm  {} Reference tone  {} Skip  {} Quit",
+            "{} Confirm  {} Back  {} Progress  {} Skip  {} Quit",
             Shortcuts::SPACE,
-            Shortcuts::REFERENCE,
+            Shortcuts::BACK,
+            Shortcuts::PIANO,
             Shortcuts::SKIP,
             Shortcuts::QUIT
         );
         let help = Paragraph::new(help_text)
             .style(Theme::muted())
             .alignment(Alignment::Center);
-        help.render(chunks[5], buf);
+        help.render(chunks[7], buf);
     }
 }

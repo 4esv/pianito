@@ -34,7 +34,7 @@ impl CalibrationScreen {
     /// Update with a detected frequency.
     pub fn update(&mut self, freq: f32) {
         // Only accept frequencies in reasonable A4 range (400-480 Hz)
-        if freq >= 400.0 && freq <= 480.0 {
+        if (400.0..=480.0).contains(&freq) {
             self.current_freq = Some(freq);
             self.samples.push(freq);
         }

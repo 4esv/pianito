@@ -118,12 +118,14 @@ pub struct Shortcuts;
 impl Shortcuts {
     /// Space key hint.
     pub const SPACE: &'static str = "[Space]";
-    /// R key hint.
-    pub const REFERENCE: &'static str = "[R]";
     /// S key hint.
     pub const SKIP: &'static str = "[S]";
     /// Q key hint.
     pub const QUIT: &'static str = "[Q]";
+    /// B key hint.
+    pub const BACK: &'static str = "[B]";
+    /// P key hint.
+    pub const PIANO: &'static str = "[P]";
     /// Enter key hint.
     pub const ENTER: &'static str = "[Enter]";
     /// Up/Down arrows hint.
