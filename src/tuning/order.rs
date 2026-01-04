@@ -6,6 +6,7 @@
 //! 3. Octaves downward (F3→A0): Each note tuned as octave from above
 
 use super::notes::{Note, NOTES};
+use super::profile::PianoProfile;
 
 /// MIDI note numbers for key reference points.
 const F3_MIDI: u8 = 53;
@@ -118,6 +119,49 @@ impl TuningOrder {
         } else {
             "Octaves Down"
         }
+    }
+
+    /// Create a tuning order from a piano profile.
+    ///
+    /// Order:
+    /// 1. Temperament octave (F3-F4): 13 notes, always first
+    /// 2. Remaining 75 notes sorted by absolute cents deviation (worst first)
+    pub fn from_profile(profile: &PianoProfile) -> Self {
+        let mut order = Vec::with_capacity(88);
+
+        // 1. Temperament octave first (F3-F4, indices 32-44)
+        for i in F3_INDEX..=F4_INDEX {
+            order.push(i);
+        }
+
+        // 2. Collect remaining notes with their deviations
+        let mut remaining: Vec<(usize, f32)> = Vec::with_capacity(75);
+
+        for i in 0..88 {
+            // Skip temperament octave
+            if (F3_INDEX..=F4_INDEX).contains(&i) {
+                continue;
+            }
+
+            let deviation = profile.notes[i]
+                .as_ref()
+                .map(|n| n.cents.abs())
+                .unwrap_or(0.0);
+
+            remaining.push((i, deviation));
+        }
+
+        // Sort by deviation descending (worst first)
+        remaining.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Add to order
+        for (idx, _) in remaining {
+            order.push(idx);
+        }
+
+        Self { order }
     }
 }
 

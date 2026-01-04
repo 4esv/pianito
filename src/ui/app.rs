@@ -6,11 +6,13 @@ use crossterm::event::KeyCode;
 use ratatui::Frame;
 
 use crate::tuning::order::TuningOrder;
+use crate::tuning::profile::PianoProfile;
 use crate::tuning::session::{Session, TuningMode};
 use crate::tuning::temperament::Temperament;
 
 use super::screens::{
-    mode_select::SelectedMode, CalibrationScreen, CompleteScreen, ModeSelectScreen, TuningScreen,
+    mode_select::SelectedMode, CalibrationScreen, CompleteScreen, ModeSelectScreen,
+    ProfilingScreen, TuningScreen,
 };
 
 /// Application screen state.
@@ -20,6 +22,8 @@ pub enum AppState {
     ModeSelect,
     /// Calibration (for quick tune).
     Calibration,
+    /// Profiling all 88 keys.
+    Profiling,
     /// Main tuning screen.
     Tuning,
     /// Session complete.
@@ -38,6 +42,10 @@ pub struct App {
     mode_select: ModeSelectScreen,
     /// Calibration screen.
     calibration: CalibrationScreen,
+    /// Profiling screen (for profile mode).
+    profiling: Option<ProfilingScreen>,
+    /// Piano profile (from profiling mode).
+    profile: Option<PianoProfile>,
     /// Tuning screen (created when tuning starts).
     tuning: Option<TuningScreen>,
     /// Complete screen (created when session ends).
@@ -59,6 +67,8 @@ impl App {
             should_quit: false,
             mode_select: ModeSelectScreen::new(),
             calibration: CalibrationScreen::new(),
+            profiling: None,
+            profile: None,
             tuning: None,
             complete: None,
             tuning_order: TuningOrder::new(),
@@ -113,6 +123,7 @@ impl App {
         match self.state {
             AppState::ModeSelect => self.handle_mode_select_key(key),
             AppState::Calibration => self.handle_calibration_key(key),
+            AppState::Profiling => self.handle_profiling_key(key),
             AppState::Tuning => self.handle_tuning_key(key),
             AppState::Complete => self.handle_complete_key(key),
         }
@@ -201,6 +212,7 @@ impl App {
         let mode = match self.mode_select.selected() {
             SelectedMode::QuickTune => TuningMode::Quick,
             SelectedMode::ConcertPitch => TuningMode::Concert,
+            SelectedMode::Profile => TuningMode::Profile,
         };
 
         match mode {
@@ -212,6 +224,68 @@ impl App {
                 self.temperament = Temperament::new();
                 self.start_tuning();
             }
+            TuningMode::Profile => {
+                self.start_profiling();
+            }
+        }
+    }
+
+    /// Start the profiling phase.
+    fn start_profiling(&mut self) {
+        self.profiling = Some(ProfilingScreen::new());
+        self.temperament = Temperament::new();
+        self.state = AppState::Profiling;
+    }
+
+    /// Handle key press in profiling state.
+    fn handle_profiling_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char(' ') => {
+                // Confirm current note
+                if let Some(profiling) = &mut self.profiling {
+                    if profiling.confirm_note() {
+                        self.finish_profiling();
+                    }
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                // Go back to previous note
+                if let Some(profiling) = &mut self.profiling {
+                    profiling.go_back();
+                }
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                // Skip current note
+                if let Some(profiling) = &mut self.profiling {
+                    if profiling.skip_note() {
+                        self.finish_profiling();
+                    }
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                self.quit();
+            }
+            _ => {}
+        }
+    }
+
+    /// Finish profiling and transition to tuning.
+    fn finish_profiling(&mut self) {
+        if let Some(profiling) = self.profiling.take() {
+            let profile = profiling.take_profile();
+
+            // Save the profile
+            if let Err(e) = profile.save() {
+                // Log error but continue
+                eprintln!("Failed to save profile: {}", e);
+            }
+
+            // Create tuning order based on profile deviations
+            self.tuning_order = TuningOrder::from_profile(&profile);
+            self.profile = Some(profile);
+
+            // Start tuning with the profile-based order
+            self.start_tuning();
         }
     }
 
@@ -220,6 +294,7 @@ impl App {
         let mode = match self.mode_select.selected() {
             SelectedMode::QuickTune => TuningMode::Quick,
             SelectedMode::ConcertPitch => TuningMode::Concert,
+            SelectedMode::Profile => TuningMode::Profile,
         };
 
         self.session = Some(Session::new(mode, self.temperament.a4()));
@@ -280,6 +355,18 @@ impl App {
                     }
                 }
             }
+            AppState::Profiling => {
+                if let Some(profiling) = &mut self.profiling {
+                    if confidence > 0.6 {
+                        let note = profiling.current_note();
+                        let target = self.temperament.frequency(note.midi);
+                        let cents = self.temperament.cents_from_target(freq, target);
+                        profiling.update(freq, cents);
+                    } else {
+                        profiling.clear();
+                    }
+                }
+            }
             AppState::Tuning => {
                 if let Some(tuning) = &mut self.tuning {
                     if confidence > 0.6 {
@@ -300,6 +387,11 @@ impl App {
         match self.state {
             AppState::Calibration => {
                 self.calibration.clear();
+            }
+            AppState::Profiling => {
+                if let Some(profiling) = &mut self.profiling {
+                    profiling.clear();
+                }
             }
             AppState::Tuning => {
                 if let Some(tuning) = &mut self.tuning {
@@ -399,9 +491,12 @@ impl App {
     fn reset(&mut self) {
         self.state = AppState::ModeSelect;
         self.session = None;
+        self.profiling = None;
+        self.profile = None;
         self.tuning = None;
         self.complete = None;
         self.current_note_idx = 0;
+        self.tuning_order = TuningOrder::new();
         self.mode_select = ModeSelectScreen::new();
         self.calibration = CalibrationScreen::new();
     }
@@ -416,6 +511,11 @@ impl App {
             }
             AppState::Calibration => {
                 frame.render_widget(&self.calibration, area);
+            }
+            AppState::Profiling => {
+                if let Some(profiling) = &self.profiling {
+                    frame.render_widget(profiling, area);
+                }
             }
             AppState::Tuning => {
                 if let Some(tuning) = &self.tuning {

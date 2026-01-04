@@ -1,5 +1,5 @@
 [package]
-name = "onkey"
+name = "pianito"
 version = "0.1.0"
 edition = "2021"
 description = "CLI piano tuner with guided coaching and real-time visual feedback"
