@@ -15,6 +15,8 @@ pub enum TuningMode {
     /// Concert pitch tuning (A4 = 440Hz or custom).
     #[default]
     Concert,
+    /// Profile mode: measure all 88 keys to determine tuning priority.
+    Profile,
 }
 
 /// A completed note in a tuning session.
@@ -109,7 +111,7 @@ impl Session {
 
     /// Get the sessions directory path.
     fn sessions_dir() -> Option<PathBuf> {
-        ProjectDirs::from("", "", "onkey").map(|dirs| dirs.data_dir().join("sessions"))
+        ProjectDirs::from("", "", "pianito").map(|dirs| dirs.data_dir().join("sessions"))
     }
 
     /// Get the path for this session's file.

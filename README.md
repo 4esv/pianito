@@ -1,4 +1,4 @@
-# onkey
+# pianito
 
 A terminal-based piano tuning application for macOS with guided coaching.
 
@@ -20,12 +20,12 @@ A terminal-based piano tuning application for macOS with guided coaching.
 Requires Rust 1.70+ and a working microphone.
 
 ```bash
-git clone https://github.com/4esv/onkey.git
-cd onkey
+git clone https://github.com/4esv/pianito.git
+cd pianito
 cargo build --release
 ```
 
-The binary will be at `target/release/onkey`.
+The binary will be at `target/release/pianito`.
 
 ## Usage
 
@@ -33,16 +33,16 @@ The binary will be at `target/release/onkey`.
 
 ```bash
 # Start interactive tuning (concert pitch mode)
-onkey
+pianito
 
 # Resume an interrupted session
-onkey --resume
+pianito --resume
 
 # Quick tune mode (calibrates to piano's current pitch)
-onkey --quick
+pianito --quick
 
 # Custom A4 reference frequency
-onkey --a4 442
+pianito --a4 442
 ```
 
 ### Keyboard Controls
@@ -60,22 +60,22 @@ onkey --a4 442
 
 ```bash
 # Analyze a WAV file for pitch content
-onkey analyze recording.wav
+pianito analyze recording.wav
 
 # Play a reference tone
-onkey reference A4
-onkey reference C5 --duration 3.0
+pianito reference A4
+pianito reference C5 --duration 3.0
 
 # Show tuning session history
-onkey history
+pianito history
 
 # Clear all saved sessions
-onkey reset
+pianito reset
 ```
 
 ## Configuration
 
-Configuration is stored at `~/.config/onkey/config.toml`:
+Configuration is stored at `~/.config/pianito/config.toml`:
 
 ```toml
 # Default A4 reference frequency

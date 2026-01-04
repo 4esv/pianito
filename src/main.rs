@@ -1,4 +1,4 @@
-//! onkey - CLI Piano Tuner
+//! pianito - CLI Piano Tuner
 //!
 //! A terminal-based piano tuning application with guided coaching.
 
@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use onkey::audio::{AudioOutput, AudioSource, MicCapture, PitchDetector, WavAudioSource};
-use onkey::config::{Args, Command, Config};
-use onkey::tuning::notes::Note;
-use onkey::tuning::session::Session;
-use onkey::tuning::temperament::Temperament;
-use onkey::ui::{self, App};
+use pianito::audio::{AudioOutput, AudioSource, MicCapture, PitchDetector, WavAudioSource};
+use pianito::config::{Args, Command, Config};
+use pianito::tuning::notes::Note;
+use pianito::tuning::session::Session;
+use pianito::tuning::temperament::Temperament;
+use pianito::ui::{self, App};
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -176,7 +176,7 @@ fn reset_sessions() -> anyhow::Result<()> {
 }
 
 /// Run the interactive tuning application.
-fn run_interactive(config: onkey::config::EffectiveConfig) -> anyhow::Result<()> {
+fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<()> {
     // Initialize audio capture
     let mut mic = match MicCapture::new() {
         Ok(m) => m,

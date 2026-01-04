@@ -13,7 +13,7 @@
 //!         C D   F G A
 //! ```
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::{
     buffer::Buffer,
@@ -21,6 +21,8 @@ use ratatui::{
     style::{Color, Style},
     widgets::Widget,
 };
+
+use crate::ui::theme::Theme;
 
 /// Characters for piano rendering.
 pub mod chars {
@@ -67,6 +69,9 @@ pub struct Piano {
     num_keys: usize,
     /// Set of highlighted key indices (relative to start).
     highlighted: HashSet<usize>,
+    /// Per-key deviations in cents (key index -> cents).
+    /// Keys with deviations are colored by their deviation value.
+    deviations: HashMap<usize, f32>,
     /// Currently active key (shown with accent color).
     current: Option<usize>,
     /// Color for highlighted keys.
@@ -84,6 +89,7 @@ impl Piano {
             start_midi,
             num_keys,
             highlighted: HashSet::new(),
+            deviations: HashMap::new(),
             current: None,
             on_color: Color::Green,
             current_color: Color::Cyan,
@@ -128,6 +134,13 @@ impl Piano {
     /// Mark as continuing (no right corner in border).
     pub fn continuing(mut self, cont: bool) -> Self {
         self.continuing = cont;
+        self
+    }
+
+    /// Set per-key deviations for deviation-based coloring.
+    /// Keys with deviations will be colored green/yellow/red based on cents.
+    pub fn with_deviations(mut self, deviations: HashMap<usize, f32>) -> Self {
+        self.deviations = deviations;
         self
     }
 
@@ -265,15 +278,20 @@ impl Piano {
         result
     }
 
-    /// Check if a key is "on" (highlighted or current).
+    /// Check if a key is "on" (highlighted, has deviation, or current).
     fn is_on(&self, index: usize) -> bool {
-        self.highlighted.contains(&index) || self.current == Some(index)
+        self.highlighted.contains(&index)
+            || self.deviations.contains_key(&index)
+            || self.current == Some(index)
     }
 
     /// Get style for a key.
     fn key_style(&self, index: usize) -> Style {
         if self.current == Some(index) {
             Style::default().fg(self.current_color)
+        } else if let Some(&cents) = self.deviations.get(&index) {
+            // Color by deviation: green (in-tune), yellow (warning), red (out-of-tune)
+            Style::default().fg(Theme::color_for_cents(cents))
         } else if self.highlighted.contains(&index) {
             Style::default().fg(self.on_color)
         } else {

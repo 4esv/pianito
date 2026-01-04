@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// CLI Piano Tuner with guided coaching.
 #[derive(Parser, Debug)]
-#[command(name = "onkey")]
+#[command(name = "pianito")]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     #[command(subcommand)]
@@ -96,10 +96,10 @@ impl Default for Config {
 impl Config {
     /// Get the config file path.
     pub fn config_path() -> Option<PathBuf> {
-        ProjectDirs::from("", "", "onkey").map(|dirs| dirs.config_dir().join("config.toml"))
+        ProjectDirs::from("", "", "pianito").map(|dirs| dirs.config_dir().join("config.toml"))
     }
 
-    /// Load configuration from ~/.config/onkey/config.toml.
+    /// Load configuration from ~/.config/pianito/config.toml.
     pub fn load() -> Self {
         let path = match Self::config_path() {
             Some(p) => p,
