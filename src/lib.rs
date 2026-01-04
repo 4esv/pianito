@@ -1,4 +1,4 @@
-//! onkey - CLI Piano Tuner
+//! pianito - CLI Piano Tuner
 //!
 //! A terminal-based piano tuning application with guided coaching
 //! and real-time visual feedback.

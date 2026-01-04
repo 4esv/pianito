@@ -15,6 +15,7 @@ pub enum SelectedMode {
     #[default]
     QuickTune,
     ConcertPitch,
+    Profile,
 }
 
 impl SelectedMode {
@@ -23,6 +24,7 @@ impl SelectedMode {
         match self {
             Self::QuickTune => "Quick Tune",
             Self::ConcertPitch => "Concert Pitch (A4 = 440 Hz)",
+            Self::Profile => "Profile Piano",
         }
     }
 
@@ -31,6 +33,7 @@ impl SelectedMode {
         match self {
             Self::QuickTune => "Calibrate to the piano's current pitch center, then tune all strings relative to that. Best for regular maintenance.",
             Self::ConcertPitch => "Tune all strings to standard concert pitch (A4 = 440 Hz). Use for pianos that are already close to pitch.",
+            Self::Profile => "Play all 88 keys (A0→C8) to measure deviations, then tune worst notes first while preserving the temperament octave.",
         }
     }
 }
@@ -57,13 +60,18 @@ impl ModeSelectScreen {
     pub fn next(&mut self) {
         self.selected = match self.selected {
             SelectedMode::QuickTune => SelectedMode::ConcertPitch,
-            SelectedMode::ConcertPitch => SelectedMode::QuickTune,
+            SelectedMode::ConcertPitch => SelectedMode::Profile,
+            SelectedMode::Profile => SelectedMode::QuickTune,
         };
     }
 
-    /// Select the previous mode (same as next for 2 options).
+    /// Select the previous mode.
     pub fn prev(&mut self) {
-        self.next();
+        self.selected = match self.selected {
+            SelectedMode::QuickTune => SelectedMode::Profile,
+            SelectedMode::ConcertPitch => SelectedMode::QuickTune,
+            SelectedMode::Profile => SelectedMode::ConcertPitch,
+        };
     }
 }
 
@@ -79,7 +87,7 @@ impl Widget for &ModeSelectScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Theme::border())
-            .title(" onkey - Piano Tuner ")
+            .title(" pianito - Piano Tuner ")
             .title_style(Theme::title());
 
         let inner = block.inner(area);
@@ -107,7 +115,11 @@ impl Widget for &ModeSelectScreen {
         title.render(chunks[0], buf);
 
         // Mode options
-        let modes = [SelectedMode::QuickTune, SelectedMode::ConcertPitch];
+        let modes = [
+            SelectedMode::QuickTune,
+            SelectedMode::ConcertPitch,
+            SelectedMode::Profile,
+        ];
         let option_height = 4;
         let options_area = chunks[2];
 
