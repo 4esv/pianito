@@ -157,3 +157,217 @@ pub struct EffectiveConfig {
     /// Resume previous session.
     pub resume: bool,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_default_config_values() {
+        let config = Config::default();
+        assert_eq!(config.a4, 440.0);
+        assert_eq!(config.tolerance, 5.0);
+        assert!(!config.beep);
+        assert_eq!(config.default_mode, "concert");
+    }
+
+    #[test]
+    fn test_default_functions() {
+        assert_eq!(default_a4(), 440.0);
+        assert_eq!(default_tolerance(), 5.0);
+        assert_eq!(default_mode(), "concert");
+    }
+
+    #[test]
+    fn test_merge_with_args_defaults() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            a4: None,
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+
+        assert_eq!(effective.a4, 440.0);
+        assert_eq!(effective.tolerance, 5.0);
+        assert!(!effective.beep);
+        assert!(!effective.quick_mode);
+        assert!(!effective.resume);
+    }
+
+    #[test]
+    fn test_merge_with_args_overrides_a4() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            a4: Some(442.0),
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+        assert_eq!(effective.a4, 442.0);
+    }
+
+    #[test]
+    fn test_merge_with_args_enables_beep() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            a4: None,
+            beep: true,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.beep);
+    }
+
+    #[test]
+    fn test_merge_with_args_quick_mode_from_arg() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: true,
+            a4: None,
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.quick_mode);
+    }
+
+    #[test]
+    fn test_merge_with_args_quick_mode_from_config() {
+        let mut config = Config::default();
+        config.default_mode = "quick".to_string();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            a4: None,
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.quick_mode);
+    }
+
+    #[test]
+    fn test_merge_with_args_resume_flag() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: true,
+            quick: false,
+            a4: None,
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.resume);
+    }
+
+    #[test]
+    fn test_merge_beep_from_config() {
+        let mut config = Config::default();
+        config.beep = true;
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            a4: None,
+            beep: false,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.beep); // Config beep is true
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = Config {
+            a4: 442.0,
+            tolerance: 10.0,
+            beep: true,
+            default_mode: "quick".to_string(),
+        };
+
+        let toml = toml::to_string(&config).expect("Should serialize");
+        assert!(toml.contains("a4 = 442"));
+        assert!(toml.contains("tolerance = 10"));
+        assert!(toml.contains("beep = true"));
+        assert!(toml.contains("default_mode = \"quick\""));
+    }
+
+    #[test]
+    fn test_config_deserialization() {
+        let toml = r#"
+            a4 = 442.0
+            tolerance = 10.0
+            beep = true
+            default_mode = "quick"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("Should deserialize");
+        assert_eq!(config.a4, 442.0);
+        assert_eq!(config.tolerance, 10.0);
+        assert!(config.beep);
+        assert_eq!(config.default_mode, "quick");
+    }
+
+    #[test]
+    fn test_config_partial_deserialization_uses_defaults() {
+        let toml = r#"
+            a4 = 442.0
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("Should deserialize");
+        assert_eq!(config.a4, 442.0);
+        assert_eq!(config.tolerance, 5.0); // default
+        assert!(!config.beep); // default
+        assert_eq!(config.default_mode, "concert"); // default
+    }
+
+    #[test]
+    fn test_config_load_missing_file_returns_default() {
+        // This will try to load from the real config path
+        // which likely doesn't exist in test environment
+        let config = Config::load();
+        assert_eq!(config.a4, 440.0);
+        assert_eq!(config.tolerance, 5.0);
+    }
+
+    #[test]
+    fn test_config_save_and_load_roundtrip() {
+        let temp_dir = TempDir::new().expect("Should create temp dir");
+        let config_path = temp_dir.path().join("config.toml");
+
+        let original = Config {
+            a4: 442.0,
+            tolerance: 10.0,
+            beep: true,
+            default_mode: "quick".to_string(),
+        };
+
+        // Save to temp file
+        let content = toml::to_string_pretty(&original).expect("Should serialize");
+        fs::write(&config_path, content).expect("Should write");
+
+        // Load from temp file
+        let content = fs::read_to_string(&config_path).expect("Should read");
+        let loaded: Config = toml::from_str(&content).expect("Should deserialize");
+
+        assert_eq!(loaded.a4, 442.0);
+        assert_eq!(loaded.tolerance, 10.0);
+        assert!(loaded.beep);
+        assert_eq!(loaded.default_mode, "quick");
+    }
+
+    #[test]
+    fn test_invalid_toml_falls_back_to_default() {
+        let invalid_toml = "this is not valid toml {{{}";
+        let config: Config = toml::from_str(invalid_toml).unwrap_or_default();
+        assert_eq!(config.a4, 440.0); // Should fall back to default
+    }
+}
