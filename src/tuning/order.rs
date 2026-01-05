@@ -152,9 +152,7 @@ impl TuningOrder {
         }
 
         // Sort by deviation descending (worst first)
-        remaining.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        remaining.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Add to order
         for (idx, _) in remaining {

@@ -245,3 +245,153 @@ impl Widget for CompactMeter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_position_at_zero() {
+        let pos = Meter::log_position(0.0, 500.0, 50.0, 5.0);
+        assert_eq!(pos, 0.0);
+    }
+
+    #[test]
+    fn test_log_position_within_tolerance() {
+        let pos1 = Meter::log_position(3.0, 500.0, 50.0, 5.0);
+        let pos2 = Meter::log_position(-4.0, 500.0, 50.0, 5.0);
+        assert_eq!(pos1, 0.0);
+        assert_eq!(pos2, 0.0);
+    }
+
+    #[test]
+    fn test_log_position_at_tolerance_boundary() {
+        let pos1 = Meter::log_position(5.0, 500.0, 50.0, 5.0);
+        let pos2 = Meter::log_position(-5.0, 500.0, 50.0, 5.0);
+        assert_eq!(pos1, 0.0);
+        assert_eq!(pos2, 0.0);
+    }
+
+    #[test]
+    fn test_log_position_symmetry() {
+        let pos_pos = Meter::log_position(50.0, 500.0, 50.0, 5.0);
+        let pos_neg = Meter::log_position(-50.0, 500.0, 50.0, 5.0);
+        assert!(
+            (pos_pos + pos_neg).abs() < 0.01,
+            "Positions should be symmetric: {} and {}",
+            pos_pos,
+            pos_neg
+        );
+    }
+
+    #[test]
+    fn test_log_position_bounds() {
+        let pos = Meter::log_position(1000.0, 500.0, 50.0, 5.0);
+        assert!(pos.abs() <= 50.0);
+
+        let neg = Meter::log_position(-1000.0, 500.0, 50.0, 5.0);
+        assert!(neg.abs() <= 50.0);
+    }
+
+    #[test]
+    fn test_log_position_at_max() {
+        let pos = Meter::log_position(500.0, 500.0, 50.0, 5.0);
+        assert!((pos - 50.0).abs() < 0.1);
+
+        let neg = Meter::log_position(-500.0, 500.0, 50.0, 5.0);
+        assert!((neg + 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_log_position_monotonic_positive() {
+        let p1 = Meter::log_position(10.0, 500.0, 50.0, 5.0);
+        let p2 = Meter::log_position(50.0, 500.0, 50.0, 5.0);
+        let p3 = Meter::log_position(100.0, 500.0, 50.0, 5.0);
+        let p4 = Meter::log_position(500.0, 500.0, 50.0, 5.0);
+
+        assert!(p1 < p2, "{} should be < {}", p1, p2);
+        assert!(p2 < p3, "{} should be < {}", p2, p3);
+        assert!(p3 < p4, "{} should be < {}", p3, p4);
+    }
+
+    #[test]
+    fn test_log_position_monotonic_negative() {
+        let p1 = Meter::log_position(-10.0, 500.0, 50.0, 5.0);
+        let p2 = Meter::log_position(-50.0, 500.0, 50.0, 5.0);
+        let p3 = Meter::log_position(-100.0, 500.0, 50.0, 5.0);
+        let p4 = Meter::log_position(-500.0, 500.0, 50.0, 5.0);
+
+        assert!(p1 > p2, "{} should be > {}", p1, p2);
+        assert!(p2 > p3, "{} should be > {}", p2, p3);
+        assert!(p3 > p4, "{} should be > {}", p3, p4);
+    }
+
+    #[test]
+    fn test_meter_new() {
+        let meter = Meter::new(10.5);
+        assert!((meter.cents - 10.5).abs() < 0.01);
+        assert!(meter.detecting);
+        assert_eq!(meter.tolerance, 5.0);
+    }
+
+    #[test]
+    fn test_meter_listening() {
+        let meter = Meter::listening();
+        assert_eq!(meter.cents, 0.0);
+        assert!(!meter.detecting);
+        assert_eq!(meter.tolerance, 5.0);
+    }
+
+    #[test]
+    fn test_meter_with_custom_tolerance() {
+        let meter = Meter::new(0.0).tolerance(10.0);
+        assert_eq!(meter.tolerance, 10.0);
+    }
+
+    #[test]
+    fn test_meter_detecting_flag() {
+        let meter = Meter::new(0.0).detecting(false);
+        assert!(!meter.detecting);
+
+        let meter = Meter::new(0.0).detecting(true);
+        assert!(meter.detecting);
+    }
+
+    #[test]
+    fn test_compact_meter_new() {
+        let meter = CompactMeter::new(25.0, 80);
+        assert!((meter.cents - 25.0).abs() < 0.01);
+        assert_eq!(meter.width, 80);
+    }
+
+    #[test]
+    fn test_log_position_different_tolerances() {
+        let pos1 = Meter::log_position(10.0, 500.0, 50.0, 5.0);
+        let pos2 = Meter::log_position(10.0, 500.0, 50.0, 10.0);
+
+        // With tolerance=5, 10 cents is outside zone
+        // With tolerance=10, 10 cents is inside zone (should be 0)
+        assert!(pos1 > 0.0);
+        assert_eq!(pos2, 0.0);
+    }
+
+    #[test]
+    fn test_log_position_scaling() {
+        // Test that half_width scales the output correctly
+        let pos1 = Meter::log_position(100.0, 500.0, 25.0, 5.0);
+        let pos2 = Meter::log_position(100.0, 500.0, 50.0, 5.0);
+
+        // pos2 should be exactly 2x pos1
+        assert!((pos2 / pos1 - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_log_position_edge_cases() {
+        // Test exact tolerance boundary
+        let pos = Meter::log_position(5.0001, 500.0, 50.0, 5.0);
+        assert!(pos > 0.0, "Just above tolerance should be positive");
+
+        let pos = Meter::log_position(-5.0001, 500.0, 50.0, 5.0);
+        assert!(pos < 0.0, "Just below tolerance should be negative");
+    }
+}
