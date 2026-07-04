@@ -46,6 +46,10 @@ fn analyze_file(path: &str, a4: f32) -> anyhow::Result<()> {
     let chunk_size = (sample_rate as usize) / 4; // 250ms chunks
     let mut buffer = vec![0.0f32; chunk_size];
     let mut detections = Vec::new();
+    // NOTE: `nearest_note` returns `None` outside the 88-key span (A0-C8) -
+    // report these instead of silently dropping them (issue #16); the
+    // future partial analyzer will surface exactly this kind of content.
+    let mut out_of_range = Vec::new();
 
     loop {
         let read = source.read_samples(&mut buffer);
@@ -54,47 +58,62 @@ fn analyze_file(path: &str, a4: f32) -> anyhow::Result<()> {
         }
 
         if let Some(result) = detector.detect(&buffer[..read]) {
-            let (midi, cents) = temperament.nearest_note(result.frequency);
-            if let Some(note) = Note::from_midi(midi) {
-                detections.push((
-                    result.frequency,
-                    note.display_name(),
-                    cents,
-                    result.confidence,
-                ));
+            match temperament.nearest_note(result.frequency) {
+                Some((midi, cents)) => {
+                    if let Some(note) = Note::from_midi(midi) {
+                        detections.push((
+                            result.frequency,
+                            note.display_name(),
+                            cents,
+                            result.confidence,
+                        ));
+                    }
+                }
+                None => out_of_range.push(result.frequency),
             }
         }
     }
 
-    if detections.is_empty() {
+    if detections.is_empty() && out_of_range.is_empty() {
         println!("No pitch detected in file.");
     } else {
-        println!("\nDetected pitches:");
-        println!(
-            "{:<10} {:<8} {:<12} {:<10}",
-            "Freq (Hz)", "Note", "Cents", "Confidence"
-        );
-        println!("{}", "-".repeat(42));
-
-        for (freq, note, cents, confidence) in &detections {
-            println!(
-                "{:<10.1} {:<8} {:+<12.1} {:<10.2}",
-                freq, note, cents, confidence
-            );
-        }
-
-        // Summary
         if !detections.is_empty() {
+            println!("\nDetected pitches:");
+            println!(
+                "{:<10} {:<8} {:<12} {:<10}",
+                "Freq (Hz)", "Note", "Cents", "Confidence"
+            );
+            println!("{}", "-".repeat(42));
+
+            for (freq, note, cents, confidence) in &detections {
+                println!(
+                    "{:<10.1} {:<8} {:+<12.1} {:<10.2}",
+                    freq, note, cents, confidence
+                );
+            }
+
+            // Summary
             let avg_freq: f32 =
                 detections.iter().map(|(f, _, _, _)| f).sum::<f32>() / detections.len() as f32;
-            let (midi, cents) = temperament.nearest_note(avg_freq);
-            if let Some(note) = Note::from_midi(midi) {
-                println!(
-                    "\nAverage: {:.1} Hz ({} {:+.1} cents)",
-                    avg_freq,
-                    note.display_name(),
-                    cents
-                );
+            if let Some((midi, cents)) = temperament.nearest_note(avg_freq) {
+                if let Some(note) = Note::from_midi(midi) {
+                    println!(
+                        "\nAverage: {:.1} Hz ({} {:+.1} cents)",
+                        avg_freq,
+                        note.display_name(),
+                        cents
+                    );
+                }
+            }
+        }
+
+        if !out_of_range.is_empty() {
+            println!(
+                "\n{} detection(s) outside the 88-key range (A0-C8) were not scored:",
+                out_of_range.len()
+            );
+            for freq in &out_of_range {
+                println!("  {:.1} Hz", freq);
             }
         }
     }
