@@ -87,6 +87,39 @@ impl TestAudioSource {
         Self::new(samples, sample_rate)
     }
 
+    /// Create a test source with an inharmonic partial stack.
+    ///
+    /// Real piano strings are stiff: partial `n` sits sharp of `n * f0` by a
+    /// factor `sqrt(1 + B*n^2)`, where `B` is the inharmonicity coefficient.
+    /// Each entry in `partials` is `(partial number, amplitude)`; the
+    /// fundamental is just partial 1 and may be omitted entirely to model the
+    /// weak/missing bass fundamental that defeats time-domain detectors.
+    ///
+    /// Unlike [`sine_with_harmonics`](Self::sine_with_harmonics), the output is
+    /// not normalized, so the requested amplitudes survive into the spectrum
+    /// for amplitude-recovery tests.
+    pub fn inharmonic(
+        fundamental: f32,
+        b: f32,
+        partials: &[(u16, f32)], // (partial number, amplitude)
+        duration_secs: f32,
+        sample_rate: u32,
+    ) -> Self {
+        let num_samples = (sample_rate as f32 * duration_secs) as usize;
+        let mut samples = vec![0.0; num_samples];
+
+        for &(n, amplitude) in partials {
+            let nf = n as f32;
+            let freq = nf * fundamental * (1.0 + b * nf * nf).sqrt();
+            for (i, sample) in samples.iter_mut().enumerate() {
+                let t = i as f32 / sample_rate as f32;
+                *sample += amplitude * (2.0 * std::f32::consts::PI * freq * t).sin();
+            }
+        }
+
+        Self::new(samples, sample_rate)
+    }
+
     /// Reset position to start.
     pub fn reset(&mut self) {
         self.position = 0;
