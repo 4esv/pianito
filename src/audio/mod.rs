@@ -7,7 +7,7 @@ pub mod spectrum;
 pub mod traits;
 
 pub use capture::{AudioOutput, CaptureError, MicCapture};
-pub use pitch::{PitchDetector, PitchResult};
+pub use pitch::{DetectError, PitchDetector, PitchResult};
 pub use reference::ReferenceTone;
 pub use spectrum::{Partial, PartialAnalyzer};
 pub use traits::{AudioSink, AudioSource, TestAudioSink, TestAudioSource, WavAudioSource};
