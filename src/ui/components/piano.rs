@@ -220,62 +220,95 @@ impl Piano {
 
     /// Render a single row to a string.
     fn render_row_to_string(&self, cells: &[Cell], row: usize) -> String {
-        let mut result = String::with_capacity(cells.len());
+        (0..cells.len())
+            .map(|col| self.window_char(cells, row, 0, col, cells.len()))
+            .collect()
+    }
 
-        for (col, cell) in cells.iter().enumerate() {
-            let ch = match (cell, row) {
-                // Rows 0-1: Top rows
-                (Cell::Edge, 0..=1) => chars::EDGE,
-                (Cell::Black(i), 0..=1) => {
-                    if self.is_on(*i) {
-                        chars::BLACK_ON
-                    } else {
-                        chars::BLACK_OFF
-                    }
+    /// Character for a cell body: key rows 0-2 and plain (non-endpoint)
+    /// border cells on row 3.
+    fn cell_char(&self, cell: Cell, row: usize) -> char {
+        match (cell, row) {
+            (Cell::Edge, 0..=2) | (Cell::Black(_), 2) => chars::EDGE,
+            (Cell::Black(i), 0..=1) => {
+                if self.is_on(i) {
+                    chars::BLACK_ON
+                } else {
+                    chars::BLACK_OFF
                 }
-                (Cell::White(i), 0..=1) => {
-                    if self.is_on(*i) {
-                        chars::WHITE_ON
-                    } else {
-                        chars::WHITE_OFF
-                    }
+            }
+            (Cell::White(i), 0..=2) => {
+                if self.is_on(i) {
+                    chars::WHITE_ON
+                } else {
+                    chars::WHITE_OFF
                 }
+            }
+            (Cell::Edge | Cell::Black(_), 3) => chars::BORDER_BLACK,
+            (Cell::White(_), 3) => chars::BORDER_WHITE,
+            _ => ' ',
+        }
+    }
 
-                // Row 2: Bottom row
-                (Cell::Edge, 2) => chars::EDGE,
-                (Cell::Black(_), 2) => chars::EDGE,
-                (Cell::White(i), 2) => {
-                    if self.is_on(*i) {
-                        chars::WHITE_ON
-                    } else {
-                        chars::WHITE_OFF
-                    }
-                }
-
-                // Row 3: Border
-                (cell, 3) => {
-                    if col == 0 {
-                        chars::CORNER_LEFT
-                    } else if col == cells.len() - 1 {
-                        if self.continuing {
-                            chars::BORDER_BLACK
-                        } else {
-                            chars::CORNER_RIGHT
-                        }
-                    } else {
-                        match cell {
-                            Cell::Edge | Cell::Black(_) => chars::BORDER_BLACK,
-                            Cell::White(_) => chars::BORDER_WHITE,
-                        }
-                    }
-                }
-
-                _ => ' ',
-            };
-            result.push(ch);
+    /// Character at (`row`, `screen_col`) for a window of `cells` starting at
+    /// `offset` and spanning `display_width` cells.
+    ///
+    /// NOTE: shared by the buffer and string render paths so they cannot
+    /// diverge. On the border row, a window cut is drawn with the continuing
+    /// char (╩) instead of a corner, signaling the keyboard extends off-screen.
+    fn window_char(
+        &self,
+        cells: &[Cell],
+        row: usize,
+        offset: usize,
+        screen_col: usize,
+        display_width: usize,
+    ) -> char {
+        let col = offset + screen_col;
+        if row != 3 {
+            return self.cell_char(cells[col], row);
         }
 
-        result
+        let cut_left = screen_col == 0 && col > 0;
+        let cut_right = screen_col == display_width - 1 && col < cells.len() - 1;
+
+        if cut_left || cut_right {
+            chars::BORDER_BLACK
+        } else if col == 0 {
+            chars::CORNER_LEFT
+        } else if col == cells.len() - 1 {
+            if self.continuing {
+                chars::BORDER_BLACK
+            } else {
+                chars::CORNER_RIGHT
+            }
+        } else {
+            self.cell_char(cells[col], row)
+        }
+    }
+
+    /// Style for a cell at a given row (edges and the border row are unstyled).
+    fn cell_style(&self, cell: Cell, row: usize) -> Style {
+        match (cell, row) {
+            (Cell::Black(i), 0..=1) | (Cell::White(i), 0..=2) => self.key_style(i),
+            _ => Style::default(),
+        }
+    }
+
+    /// Leftmost visible cell column when the keyboard is wider than the
+    /// render area: keeps the current key centered, clamped to the ends.
+    fn scroll_offset(&self, cells: &[Cell], width: usize) -> usize {
+        if width == 0 || cells.len() <= width {
+            return 0;
+        }
+        let Some(current) = self.current else {
+            return 0;
+        };
+        let col = cells
+            .iter()
+            .position(|&c| matches!(c, Cell::White(i) | Cell::Black(i) if i == current))
+            .unwrap_or(0);
+        col.saturating_sub(width / 2).min(cells.len() - width)
     }
 
     /// Check if a key is "on" (highlighted, has deviation, or current).
@@ -299,73 +332,22 @@ impl Piano {
         }
     }
 
-    /// Render a single row.
-    fn render_row(&self, cells: &[Cell], row: usize, area: Rect, buf: &mut Buffer) {
+    /// Render a single row of the window starting at cell `offset`.
+    fn render_row(&self, cells: &[Cell], row: usize, offset: usize, area: Rect, buf: &mut Buffer) {
         let y = area.y + row as u16;
         if y >= area.y + area.height {
             return;
         }
 
-        let display_width = cells.len().min(area.width as usize);
+        let display_width = cells.len().saturating_sub(offset).min(area.width as usize);
 
-        for (col, cell) in cells.iter().take(display_width).enumerate() {
-            let x = area.x + col as u16;
-
-            let (ch, style) = match (cell, row) {
-                // Rows 0-1: Top rows (all keys visible)
-                (Cell::Edge, 0..=1) => (chars::EDGE, Style::default()),
-                (Cell::Black(i), 0..=1) => {
-                    let ch = if self.is_on(*i) {
-                        chars::BLACK_ON
-                    } else {
-                        chars::BLACK_OFF
-                    };
-                    (ch, self.key_style(*i))
-                }
-                (Cell::White(i), 0..=1) => {
-                    let ch = if self.is_on(*i) {
-                        chars::WHITE_ON
-                    } else {
-                        chars::WHITE_OFF
-                    };
-                    (ch, self.key_style(*i))
-                }
-
-                // Row 2: Bottom row (black keys become edges)
-                (Cell::Edge, 2) => (chars::EDGE, Style::default()),
-                (Cell::Black(_), 2) => (chars::EDGE, Style::default()),
-                (Cell::White(i), 2) => {
-                    let ch = if self.is_on(*i) {
-                        chars::WHITE_ON
-                    } else {
-                        chars::WHITE_OFF
-                    };
-                    (ch, self.key_style(*i))
-                }
-
-                // Row 3: Border
-                (cell, 3) => {
-                    let ch = if col == 0 {
-                        chars::CORNER_LEFT
-                    } else if col == display_width - 1 {
-                        if self.continuing {
-                            chars::BORDER_BLACK // ╩ for continuation
-                        } else {
-                            chars::CORNER_RIGHT // ╝ for end
-                        }
-                    } else {
-                        match cell {
-                            Cell::Edge | Cell::Black(_) => chars::BORDER_BLACK,
-                            Cell::White(_) => chars::BORDER_WHITE,
-                        }
-                    };
-                    (ch, Style::default())
-                }
-
-                _ => (' ', Style::default()),
-            };
-
-            buf.set_string(x, y, ch.to_string(), style);
+        for screen_col in 0..display_width {
+            let x = area.x + screen_col as u16;
+            let ch = self.window_char(cells, row, offset, screen_col, display_width);
+            let style = self.cell_style(cells[offset + screen_col], row);
+            // PERF: write through the cell API; set_string would allocate a
+            // String per cell (~424 per frame for the full keyboard)
+            buf[(x, y)].set_char(ch).set_style(style);
         }
     }
 }
@@ -377,9 +359,10 @@ impl Widget for Piano {
         }
 
         let cells = self.build_cells();
+        let offset = self.scroll_offset(&cells, area.width as usize);
 
         for row in 0..4 {
-            self.render_row(&cells, row, area, buf);
+            self.render_row(&cells, row, offset, area, buf);
         }
     }
 }
@@ -552,5 +535,101 @@ mod tests {
         assert_eq!(cells[2], Cell::Edge); // B-C gap
         assert_eq!(cells[3], Cell::White(1)); // C
         assert_eq!(cells[4], Cell::Edge);
+    }
+
+    /// Column of a key index within the cell layout.
+    fn column_of_key(cells: &[Cell], key: usize) -> usize {
+        cells
+            .iter()
+            .position(|&c| matches!(c, Cell::White(i) | Cell::Black(i) if i == key))
+            .expect("key in layout")
+    }
+
+    /// Render into a buffer and return the rows as strings.
+    fn render_to_buffer_strings(piano: Piano, width: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, 4);
+        let mut buf = Buffer::empty(area);
+        piano.render(area, &mut buf);
+        (0..4)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_scroll_offset_zero_when_keyboard_fits() {
+        let piano = Piano::full().current(Some(87));
+        let cells = piano.build_cells();
+
+        assert_eq!(piano.scroll_offset(&cells, cells.len()), 0);
+        assert_eq!(piano.scroll_offset(&cells, 200), 0);
+    }
+
+    #[test]
+    fn test_scroll_offset_keeps_rightmost_current_visible() {
+        // Full piano is 105 cells; a stock 80-col terminal shows ~78
+        let piano = Piano::full().current(Some(87)); // C8
+        let cells = piano.build_cells();
+        let width = 78;
+
+        let offset = piano.scroll_offset(&cells, width);
+        let col = column_of_key(&cells, 87);
+
+        assert!(
+            col >= offset && col < offset + width,
+            "C8 must be on screen"
+        );
+        assert_eq!(offset, cells.len() - width, "clamped to right end");
+    }
+
+    #[test]
+    fn test_scroll_offset_centers_current_key() {
+        let piano = Piano::full().current(Some(44));
+        let cells = piano.build_cells();
+        let width = 40;
+
+        let offset = piano.scroll_offset(&cells, width);
+        let col = column_of_key(&cells, 44);
+
+        assert_eq!(col - offset, width / 2, "current key centered in window");
+    }
+
+    #[test]
+    fn test_cut_edges_use_continuing_border() {
+        // Window in the middle of the keyboard: both border ends are cuts
+        let rows = render_to_buffer_strings(Piano::full().current(Some(44)), 40);
+
+        assert!(rows[3].starts_with('╩'), "left cut: {}", rows[3]);
+        assert!(rows[3].ends_with('╩'), "right cut: {}", rows[3]);
+    }
+
+    #[test]
+    fn test_full_width_render_keeps_corners() {
+        let piano = Piano::full();
+        let width = piano.width() as u16;
+        let rows = render_to_buffer_strings(piano, width);
+
+        assert!(rows[3].starts_with('╚'));
+        assert!(rows[3].ends_with('╝'));
+    }
+
+    #[test]
+    fn test_buffer_render_matches_string_render() {
+        // The buffer path (what users see) must agree with the string path
+        // (what the other tests assert on)
+        let build = || {
+            let highlighted: HashSet<usize> = [0, 4].into_iter().collect();
+            Piano::new(60, 12).highlighted(highlighted).current(Some(7))
+        };
+
+        let expected = build().render_to_strings();
+        let piano = build();
+        let width = piano.width() as u16;
+        let actual = render_to_buffer_strings(piano, width);
+
+        assert_eq!(actual, expected);
     }
 }

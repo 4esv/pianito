@@ -41,9 +41,9 @@ impl StretchCurve {
     /// Generate a simplified Railsback-style stretch curve.
     ///
     /// This is a simplified model based on typical Railsback curves:
-    /// - Bass notes (A0-C3): progressively flat, up to -20 cents at A0
+    /// - Bass notes (A0-C3): progressively flat, about -16 cents at A0
     /// - Middle octaves (C3-F5): close to 0, the "temperament zone"
-    /// - Treble notes (F5-C8): progressively sharp, up to +20 cents at C8
+    /// - Treble notes (F5-C8): progressively sharp, about +24 cents at C8
     fn generate_railsback_curve() -> [f32; 88] {
         let mut offsets = [0.0_f32; 88];
 
@@ -57,10 +57,10 @@ impl StretchCurve {
 
     /// Calculate stretch for a single note.
     ///
-    /// Uses a smooth cubic curve across the entire range:
-    /// - A0 (21): approximately -20 cents
+    /// Uses a sign-preserving quadratic curve (20 * x^2 * sign(x)):
+    /// - A0 (21): approximately -15.7 cents
     /// - C4 (60): approximately 0 cents
-    /// - C8 (108): approximately +20 cents
+    /// - C8 (108): approximately +23.8 cents
     fn calculate_stretch(midi: u8) -> f32 {
         // Center of the piano (around middle C)
         let center: f32 = 60.0;
@@ -69,11 +69,11 @@ impl StretchCurve {
         // Normalized position: -1 at low end, 0 at center, +1 at high end
         let x = (midi as f32 - center) / range;
 
-        // Cubic function: starts flat at center, steepens toward extremes
-        // This gives approximately:
-        // - x = -0.89 (A0): stretch ≈ -20
+        // Sign-preserving quadratic: flat at center, steepens toward
+        // extremes. This gives approximately:
+        // - x = -0.89 (A0): stretch ≈ -15.7
         // - x = 0 (C4): stretch ≈ 0
-        // - x = 1.09 (C8): stretch ≈ +20
+        // - x = 1.09 (C8): stretch ≈ +23.8
         20.0 * x * x * x.signum()
     }
 
@@ -203,14 +203,14 @@ mod tests {
         // Verify approximate magnitudes match Railsback expectations
         let a0 = curve.offset_cents(21);
         assert!(
-            a0 >= -25.0 && a0 <= -10.0,
+            (-25.0..=-10.0).contains(&a0),
             "A0 stretch {} out of expected range",
             a0
         );
 
         let c8 = curve.offset_cents(108);
         assert!(
-            c8 >= 10.0 && c8 <= 25.0,
+            (10.0..=25.0).contains(&c8),
             "C8 stretch {} out of expected range",
             c8
         );

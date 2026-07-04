@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+use super::notes::Note;
+
 /// Tuning mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -22,8 +24,14 @@ pub enum TuningMode {
 /// A completed note in a tuning session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedNote {
-    /// Note name (e.g., "F3").
+    /// Note name (e.g., "F3"), kept for display.
     pub note: String,
+    /// MIDI note number (21-108). 0 means unknown (unparseable name).
+    ///
+    /// Sessions saved before this field existed load as 0 and are
+    /// backfilled from the name in [`Session::load`].
+    #[serde(default)]
+    pub midi: u8,
     /// Final cents deviation from target.
     pub final_cents: f32,
     /// Timestamp when completed.
@@ -33,8 +41,13 @@ pub struct CompletedNote {
 impl CompletedNote {
     /// Create a new completed note.
     pub fn new(note: impl Into<String>, final_cents: f32) -> Self {
+        let note = note.into();
+        // NOTE: derive midi from the display name once at creation so
+        // consumers never have to parse the string back.
+        let midi = Note::from_name(&note).map_or(0, |n| n.midi);
         Self {
-            note: note.into(),
+            note,
+            midi,
             final_cents,
             timestamp: Utc::now(),
         }
@@ -143,8 +156,21 @@ impl Session {
     /// Load a session from a file path.
     pub fn load(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
         let content = fs::read_to_string(path)?;
-        let session: Session = serde_json::from_str(&content)?;
+        let mut session: Session = serde_json::from_str(&content)?;
+        session.backfill_midi();
         Ok(session)
+    }
+
+    /// Backfill `midi` on completed notes from sessions saved before the
+    /// field existed (parses each name once at load time).
+    fn backfill_midi(&mut self) {
+        for note in &mut self.completed_notes {
+            if note.midi == 0 {
+                if let Some(n) = Note::from_name(&note.note) {
+                    note.midi = n.midi;
+                }
+            }
+        }
     }
 
     /// Load the most recent incomplete session.
@@ -295,6 +321,7 @@ mod tests {
         assert_eq!(session.current_note_index, 1);
         assert_eq!(session.completed_notes.len(), 1);
         assert_eq!(session.completed_notes[0].note, "F3");
+        assert_eq!(session.completed_notes[0].midi, 53);
         assert_eq!(session.completed_notes[0].final_cents, 1.5);
     }
 
@@ -411,8 +438,37 @@ mod tests {
     fn test_completed_note_creation() {
         let note = CompletedNote::new("A4", -2.5);
         assert_eq!(note.note, "A4");
+        assert_eq!(note.midi, 69);
         assert_eq!(note.final_cents, -2.5);
         // Timestamp should be recent
         assert!(note.timestamp <= Utc::now());
+
+        // Unparseable names fall back to 0 (unknown).
+        let bogus = CompletedNote::new("not-a-note", 0.0);
+        assert_eq!(bogus.midi, 0);
+    }
+
+    #[test]
+    fn test_load_backfills_midi_for_legacy_sessions() {
+        let temp_dir = TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("legacy.json");
+
+        let mut session = create_test_session();
+        session.complete_note("F3", 1.5);
+        session.complete_note("C#5", -0.5);
+
+        // Strip the midi field to simulate a session saved before it existed.
+        let mut value = serde_json::to_value(&session).expect("Should serialize");
+        for note in value["completed_notes"]
+            .as_array_mut()
+            .expect("completed_notes array")
+        {
+            note.as_object_mut().expect("note object").remove("midi");
+        }
+        fs::write(&path, value.to_string()).expect("Should write file");
+
+        let loaded = Session::load(&path).expect("Should load");
+        assert_eq!(loaded.completed_notes[0].midi, 53); // F3
+        assert_eq!(loaded.completed_notes[1].midi, 73); // C#5
     }
 }

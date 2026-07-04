@@ -18,7 +18,7 @@ pub struct Args {
     #[arg(long)]
     pub resume: bool,
 
-    /// Quick tune mode (tune relative to current pitch center).
+    /// Start with Quick Tune preselected (tune relative to current pitch center).
     #[arg(long)]
     pub quick: bool,
 
@@ -26,7 +26,7 @@ pub struct Args {
     #[arg(long)]
     pub a4: Option<f32>,
 
-    /// Enable audio confirmation beep.
+    /// Beep once when a note locks into the in-tune zone.
     #[arg(long)]
     pub beep: bool,
 }
@@ -43,14 +43,29 @@ pub enum Command {
     Reference {
         /// Note name (e.g., "A4", "C5").
         note: String,
-        /// Duration in seconds.
-        #[arg(long, default_value = "2.0")]
+        /// Duration in seconds (0-60).
+        #[arg(long, default_value = "2.0", value_parser = parse_duration)]
         duration: f32,
     },
     /// Show tuning history.
     History,
     /// Clear saved sessions.
     Reset,
+}
+
+/// Parse and validate the reference tone duration.
+///
+/// NOTE: `Duration::from_secs_f32` panics on negative/NaN values and huge
+/// values overflow the sample buffer allocation, so reject them at the CLI
+/// edge. The range check also rejects NaN and infinity.
+fn parse_duration(s: &str) -> Result<f32, String> {
+    let duration: f32 = s
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid number", s))?;
+    if !(0.0..=60.0).contains(&duration) {
+        return Err("duration must be between 0 and 60 seconds".to_string());
+    }
+    Ok(duration)
 }
 
 /// Application configuration loaded from file.
@@ -242,8 +257,10 @@ mod tests {
 
     #[test]
     fn test_merge_with_args_quick_mode_from_config() {
-        let mut config = Config::default();
-        config.default_mode = "quick".to_string();
+        let config = Config {
+            default_mode: "quick".to_string(),
+            ..Config::default()
+        };
         let args = Args {
             command: None,
             resume: false,
@@ -271,8 +288,10 @@ mod tests {
 
     #[test]
     fn test_merge_beep_from_config() {
-        let mut config = Config::default();
-        config.beep = true;
+        let config = Config {
+            beep: true,
+            ..Config::default()
+        };
         let args = Args {
             command: None,
             resume: false,
@@ -369,5 +388,70 @@ mod tests {
         let invalid_toml = "this is not valid toml {{{}";
         let config: Config = toml::from_str(invalid_toml).unwrap_or_default();
         assert_eq!(config.a4, 440.0); // Should fall back to default
+    }
+
+    fn args(a4: Option<f32>, quick: bool, beep: bool) -> Args {
+        Args {
+            command: None,
+            resume: false,
+            quick,
+            a4,
+            beep,
+        }
+    }
+
+    #[test]
+    fn empty_toml_is_all_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.a4, 440.0);
+        assert_eq!(config.tolerance, 5.0);
+        assert!(!config.beep);
+        assert_eq!(config.default_mode, "concert");
+    }
+
+    #[test]
+    fn malformed_field_fails_the_whole_parse() {
+        // WARNING: pins the behavior behind load()'s unwrap_or_default():
+        // one bad field (e.g. a quoted number) discards the ENTIRE config,
+        // silently reverting a4 to 440.
+        assert!(toml::from_str::<Config>("a4 = \"442\"").is_err());
+        assert!(toml::from_str::<Config>("a4 = 442.0\ntolerance = true").is_err());
+    }
+
+    #[test]
+    fn cli_a4_overrides_config_a4() {
+        let config = Config {
+            a4: 442.0,
+            ..Config::default()
+        };
+        let effective = config.merge_with_args(&args(Some(443.0), false, false));
+        assert_eq!(effective.a4, 443.0);
+    }
+
+    #[test]
+    fn config_a4_used_without_cli_override() {
+        let config = Config {
+            a4: 442.0,
+            ..Config::default()
+        };
+        let effective = config.merge_with_args(&args(None, false, false));
+        assert_eq!(effective.a4, 442.0);
+    }
+
+    #[test]
+    fn duration_accepts_valid_values() {
+        assert_eq!(parse_duration("2.0").unwrap(), 2.0);
+        assert_eq!(parse_duration("60").unwrap(), 60.0);
+        assert_eq!(parse_duration("0").unwrap(), 0.0);
+    }
+
+    #[test]
+    fn duration_rejects_out_of_range_and_non_finite() {
+        assert!(parse_duration("-1").is_err());
+        assert!(parse_duration("60.1").is_err());
+        assert!(parse_duration("1e30").is_err());
+        assert!(parse_duration("NaN").is_err());
+        assert!(parse_duration("inf").is_err());
+        assert!(parse_duration("abc").is_err());
     }
 }
