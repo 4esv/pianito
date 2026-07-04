@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// CLI Piano Tuner with guided coaching.
 #[derive(Parser, Debug)]
@@ -116,16 +116,23 @@ impl Config {
 
     /// Load configuration from ~/.config/pianito/config.toml.
     pub fn load() -> Self {
-        let path = match Self::config_path() {
-            Some(p) => p,
-            None => return Self::default(),
-        };
+        match Self::config_path() {
+            Some(path) => Self::load_from(&path),
+            None => Self::default(),
+        }
+    }
 
+    /// Load configuration from a specific path, falling back to defaults on a
+    /// missing file, read error, or parse error.
+    ///
+    /// NOTE: split out from `load()` so tests can exercise the load logic
+    /// against a `TempDir` path instead of the real user config dir.
+    pub fn load_from(path: &Path) -> Self {
         if !path.exists() {
             return Self::default();
         }
 
-        match fs::read_to_string(&path) {
+        match fs::read_to_string(path) {
             Ok(content) => toml::from_str(&content).unwrap_or_default(),
             Err(_) => Self::default(),
         }
@@ -350,9 +357,14 @@ mod tests {
 
     #[test]
     fn test_config_load_missing_file_returns_default() {
-        // This will try to load from the real config path
-        // which likely doesn't exist in test environment
-        let config = Config::load();
+        // Hermetic: point at a path inside a fresh TempDir that does not
+        // exist, so the result never depends on the developer's real
+        // ~/.config/pianito (a dogfooded a4=442 must not break this test).
+        let temp_dir = TempDir::new().expect("Should create temp dir");
+        let missing = temp_dir.path().join("config.toml");
+        assert!(!missing.exists());
+
+        let config = Config::load_from(&missing);
         assert_eq!(config.a4, 440.0);
         assert_eq!(config.tolerance, 5.0);
     }
