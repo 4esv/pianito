@@ -21,6 +21,14 @@ pub struct PitchDetector {
 }
 
 impl PitchDetector {
+    /// Minimum amount by which the `2*tau` dip must beat the current dip for
+    /// the octave post-check to move down an octave. Compared against
+    /// interpolated dip depths, it sits between the two regimes: every clean
+    /// fundamental's dips interpolate to ~0 (gap <= ~0.0005), while a
+    /// partial-pick leaves a genuinely shallow dip with a much deeper
+    /// true-fundamental dip an octave down (gap >= ~0.012).
+    const OCTAVE_MARGIN: f32 = 0.01;
+
     /// Create a new pitch detector.
     pub fn new(sample_rate: u32) -> Self {
         Self {
@@ -66,7 +74,15 @@ impl PitchDetector {
         let cmnd = self.cumulative_mean_normalized_difference(&diff);
 
         // Step 4: Absolute threshold
-        let tau = self.find_threshold_crossing(&cmnd, tau_min, tau_max)?;
+        let mut tau = self.find_threshold_crossing(&cmnd, tau_min, tau_max)?;
+
+        // Step 4b: Octave-error post-check. YIN's first-dip rule can lock onto
+        // a strong partial (a weak-fundamental bass note, a decaying treble
+        // note whose 2nd partial dominates), reporting a pitch an octave high.
+        // Walk down to the true fundamental while a deeper dip sits at ~2*tau.
+        while let Some(lower) = self.octave_below(&cmnd, tau, tau_max) {
+            tau = lower;
+        }
 
         // Step 5: Parabolic interpolation for sub-sample accuracy
         let refined_tau = self.parabolic_interpolation(&cmnd, tau);
@@ -152,24 +168,75 @@ impl PitchDetector {
             }
         }
 
-        // If no threshold crossing, find absolute minimum (fallback)
-        let mut min_tau = tau_min;
-        let mut min_val = cmnd[tau_min];
+        // NOTE: no bare global-minimum fallback. When no lag drives cmnd below
+        // the threshold, the only thing left is a shallow dip — precisely the
+        // regime (inharmonic bass, decaying treble) where a partial's period
+        // wins and the "best" minimum is an octave/sub-harmonic off the true
+        // fundamental. Without a target-note prior to sanity-check it here,
+        // reporting no pitch is safer than reporting a confidently wrong one;
+        // the caller shows no reading for the frame.
+        None
+    }
 
-        #[allow(clippy::needless_range_loop)]
-        for tau in tau_min + 1..tau_max {
-            if cmnd[tau] < min_val {
-                min_val = cmnd[tau];
-                min_tau = tau;
+    /// Step 4b: Octave-error post-check.
+    ///
+    /// Given the chosen lag `tau`, look for the dip near `2*tau` (the next
+    /// octave down). If that lower-frequency dip is *deeper* than the current
+    /// one by more than [`Self::OCTAVE_MARGIN`], then `tau` was a partial and
+    /// the fundamental sits at the longer lag — return it so the caller adopts
+    /// it.
+    ///
+    /// NOTE: the guard compares interpolated dip *depths*, not raw cmnd bins,
+    /// and it is a deeper-by-a-margin test rather than the naive "cmnd[2*tau]
+    /// within a small margin of cmnd[tau]" rule. Two reasons:
+    /// - On a clean tone the dips at every period multiple all bottom out at ~0,
+    ///   so a "within margin" test would octave-*down* every clean note; only a
+    ///   genuinely deeper low dip should win.
+    /// - At small tau (treble), the true minimum falls between integer samples,
+    ///   so the raw `cmnd[tau]` bin is inflated (~0.03 for a clean 3.5 kHz tone)
+    ///   even though the note is unambiguous. Parabolic interpolation recovers
+    ///   the real ~0 depth, keeping clean treble from being pulled down.
+    fn octave_below(&self, cmnd: &[f32], tau: usize, tau_max: usize) -> Option<usize> {
+        let target = tau * 2;
+        if target >= tau_max || target >= cmnd.len() {
+            return None;
+        }
+
+        // Inharmonic partials sit slightly off an exact octave, so search a
+        // small window around 2*tau for the local minimum rather than trusting
+        // the exact bin.
+        let window = (tau / 20).max(1);
+        let lo = target.saturating_sub(window).max(1);
+        let hi = (target + window).min(cmnd.len() - 1).min(tau_max - 1);
+        let mut best = lo;
+        for t in (lo + 1)..=hi {
+            if cmnd[t] < cmnd[best] {
+                best = t;
             }
         }
 
-        // Only return if it's a reasonable minimum
-        if min_val < 0.5 {
-            Some(min_tau)
-        } else {
-            None
+        let gap = self.dip_depth(cmnd, tau) - self.dip_depth(cmnd, best);
+        (gap > Self::OCTAVE_MARGIN).then_some(best)
+    }
+
+    /// Interpolated depth of the dip at `tau`: the value of the parabola fit
+    /// through `cmnd[tau-1..=tau+1]` at its vertex, clamped to be non-negative.
+    /// This recovers the true minimum when it lies between integer samples,
+    /// which matters at short lags (high frequencies) where the raw bin value
+    /// overstates how shallow the dip really is.
+    fn dip_depth(&self, cmnd: &[f32], tau: usize) -> f32 {
+        if tau == 0 || tau + 1 >= cmnd.len() {
+            return cmnd[tau];
         }
+        let s0 = cmnd[tau - 1];
+        let s1 = cmnd[tau];
+        let s2 = cmnd[tau + 1];
+        let denominator = s0 - 2.0 * s1 + s2;
+        if denominator.abs() < 1e-10 {
+            return s1;
+        }
+        let diff = s2 - s0;
+        (s1 - diff * diff / (8.0 * denominator)).max(0.0)
     }
 
     /// Step 5: Parabolic interpolation for sub-sample accuracy.
@@ -206,6 +273,107 @@ mod tests {
         let source = TestAudioSource::sine(frequency, 0.2, SAMPLE_RATE);
         let detector = PitchDetector::new(SAMPLE_RATE);
         detector.detect(source.samples())
+    }
+
+    /// Synthesize an inharmonic partial stack with an explicit per-partial
+    /// amplitude, so the fundamental can be made weak or absent, and
+    /// stiff-string inharmonicity f_n = n*f0*sqrt(1 + B*n^2). Real piano
+    /// strings look like this (weak bass fundamentals, partials stretched
+    /// sharp); the pure-sine fixtures do not, which is exactly why they never
+    /// exercise the octave-error path.
+    fn inharmonic_stack(f0: f32, partials: &[(f32, f32)], b: f32, dur: f32) -> Vec<f32> {
+        let n = (SAMPLE_RATE as f32 * dur) as usize;
+        let mut s = vec![0.0f32; n];
+        for &(harmonic, amp) in partials {
+            let fk = harmonic * f0 * (1.0 + b * harmonic * harmonic).sqrt();
+            for (i, v) in s.iter_mut().enumerate() {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                *v += amp * (2.0 * std::f32::consts::PI * fk * t).sin();
+            }
+        }
+        let max = s.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        if max > 0.0 {
+            for v in &mut s {
+                *v /= max;
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn test_weak_fundamental_no_octave_up() {
+        // A2 (110 Hz) with a weak fundamental, dominant even partials, and
+        // mild inharmonicity. YIN's first-dip rule crosses threshold at the
+        // 2nd partial's period first and reports ~220 Hz — an octave up —
+        // unless the 2*tau post-check pulls it back to the true fundamental.
+        let signal = inharmonic_stack(
+            110.0,
+            &[
+                (1.0, 0.1),
+                (2.0, 1.0),
+                (3.0, 0.1),
+                (4.0, 0.7),
+                (5.0, 0.08),
+                (6.0, 0.5),
+            ],
+            0.0002,
+            0.1,
+        );
+        let result = PitchDetector::new(SAMPLE_RATE)
+            .detect(&signal)
+            .expect("should detect a pitch");
+        let ratio = result.frequency / 110.0;
+        assert!(
+            (0.97..1.03).contains(&ratio),
+            "expected ~110 Hz fundamental, got {} (ratio {:.2} — octave error)",
+            result.frequency,
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_shallow_dip_rejected_not_guessed() {
+        // Heavily inharmonic bass: no lag ever drives cmnd below the detection
+        // threshold, so only a shallow global minimum (~0.28) remains. The old
+        // bare `<0.5` fallback returned that minimum unvalidated, landing on a
+        // sub-harmonic period (~37 Hz, a fifth below the 55 Hz string). With no
+        // target-note prior at this layer, reporting nothing is safer than
+        // reporting a wrong pitch — the UI just shows no reading for the frame.
+        let signal = inharmonic_stack(
+            55.0,
+            &[(1.0, 0.1), (2.0, 1.0), (3.0, 0.8), (4.0, 0.6), (5.0, 0.4)],
+            0.02,
+            0.1,
+        );
+        let result = PitchDetector::new(SAMPLE_RATE).detect(&signal);
+        assert!(
+            result.is_none(),
+            "shallow-dip signal must be rejected, got {:?}",
+            result.map(|r| r.frequency)
+        );
+    }
+
+    #[test]
+    fn test_octave_check_keeps_strong_fundamental() {
+        // Regression guard: with a strong fundamental the octave post-check
+        // must NOT pull the reading down an octave (cmnd at 2*tau is a hair
+        // shallower than at tau for a real fundamental, so it stays put).
+        let signal = inharmonic_stack(
+            110.0,
+            &[(1.0, 1.0), (2.0, 0.6), (3.0, 0.3), (4.0, 0.2)],
+            0.0002,
+            0.1,
+        );
+        let result = PitchDetector::new(SAMPLE_RATE)
+            .detect(&signal)
+            .expect("should detect a pitch");
+        let ratio = result.frequency / 110.0;
+        assert!(
+            (0.97..1.03).contains(&ratio),
+            "expected ~110 Hz, got {} (ratio {:.2} — over-corrected down)",
+            result.frequency,
+            ratio
+        );
     }
 
     #[test]
