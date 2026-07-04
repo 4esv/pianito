@@ -18,7 +18,7 @@ A terminal-based piano tuning application for macOS with guided coaching.
 
 ### From Source
 
-Requires Rust 1.70+ and a working microphone.
+Requires Rust 1.82+ and a working microphone.
 
 ```bash
 git clone https://github.com/4esv/pianito.git
