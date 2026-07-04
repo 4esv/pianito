@@ -55,12 +55,17 @@ pub enum Cell {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// use std::collections::HashSet;
+/// use pianito::ui::components::piano::Piano;
+///
 /// // Full 88-key piano with some highlighted keys
 /// let highlighted: HashSet<usize> = [0, 2, 4].into_iter().collect();
 /// let piano = Piano::new(21, 88)
 ///     .highlighted(highlighted)
 ///     .current(Some(5));
+/// let cells = piano.build_cells();
+/// assert!(!cells.is_empty());
 /// ```
 pub struct Piano {
     /// Starting MIDI note (21 = A0, 108 = C8).
