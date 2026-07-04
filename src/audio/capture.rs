@@ -5,6 +5,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Error type for audio capture.
 #[derive(Debug, thiserror::Error)]
@@ -21,18 +22,27 @@ pub enum CaptureError {
     PlayStreamError(#[from] cpal::PlayStreamError),
 }
 
-/// Maximum retained capture window (~0.5 second at 44.1 kHz) for pitch detection.
-const MAX_BUFFER_SAMPLES: usize = 22050;
+/// Retained capture window for pitch detection. Sized in *time* so the sample
+/// count tracks the device rate: the old fixed 22050-sample cap held only
+/// 0.459 s at the 48 kHz device default, capping any future bass window.
+const RETAINED_WINDOW: Duration = Duration::from_millis(500);
+
+/// Samples needed to hold `window` of audio at `sample_rate`.
+fn window_samples(sample_rate: u32, window: Duration) -> usize {
+    (sample_rate as f64 * window.as_secs_f64()).round() as usize
+}
 
 /// Shared buffer for audio samples.
 struct SharedBuffer {
     samples: VecDeque<f32>,
     /// Flag to indicate new samples are available.
     new_data: bool,
+    /// Ring-buffer ceiling in samples, sized from the device rate in `new`.
+    max_samples: usize,
 }
 
 /// Downmix interleaved frames to mono f32 and append them to the shared
-/// buffer, trimming the front so at most `MAX_BUFFER_SAMPLES` are retained.
+/// buffer, trimming the front so at most `buf.max_samples` are retained.
 fn push_mono_frames<T>(buf: &mut SharedBuffer, data: &[T], channels: usize)
 where
     T: Sample,
@@ -43,9 +53,9 @@ where
         buf.samples.push_back(mono);
     }
 
-    // Keep buffer at reasonable size (~0.5 second for pitch detection)
-    if buf.samples.len() > MAX_BUFFER_SAMPLES {
-        let excess = buf.samples.len() - MAX_BUFFER_SAMPLES;
+    // Keep the retained window at its duration-sized ceiling.
+    if buf.samples.len() > buf.max_samples {
+        let excess = buf.samples.len() - buf.max_samples;
         buf.samples.drain(0..excess);
     }
 
@@ -97,6 +107,7 @@ pub struct MicCapture {
     buffer: Arc<Mutex<SharedBuffer>>,
     error: Arc<Mutex<Option<String>>>,
     sample_rate: u32,
+    max_samples: usize,
 }
 
 impl MicCapture {
@@ -113,9 +124,11 @@ impl MicCapture {
         let sample_format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
 
+        let max_samples = window_samples(sample_rate, RETAINED_WINDOW);
         let buffer = Arc::new(Mutex::new(SharedBuffer {
-            samples: VecDeque::with_capacity(MAX_BUFFER_SAMPLES),
+            samples: VecDeque::with_capacity(max_samples),
             new_data: false,
+            max_samples,
         }));
         let error = Arc::new(Mutex::new(None));
 
@@ -146,7 +159,18 @@ impl MicCapture {
             buffer,
             error,
             sample_rate,
+            max_samples,
         })
+    }
+
+    /// Number of samples retained in the capture ring buffer.
+    pub fn retained_samples(&self) -> usize {
+        self.max_samples
+    }
+
+    /// Wall-clock audio retained in the ring buffer at the device sample rate.
+    pub fn retained_duration(&self) -> Duration {
+        Duration::from_secs_f64(self.max_samples as f64 / self.sample_rate as f64)
     }
 
     fn build_stream<T>(
@@ -326,11 +350,39 @@ impl AudioOutput {
 mod tests {
     use super::*;
 
-    fn empty_shared_buffer() -> SharedBuffer {
+    fn shared_buffer_with_cap(max_samples: usize) -> SharedBuffer {
         SharedBuffer {
             samples: VecDeque::new(),
             new_data: false,
+            max_samples,
         }
+    }
+
+    fn empty_shared_buffer() -> SharedBuffer {
+        // Default to the legacy 0.5 s @ 44.1 kHz cap so downmix tests that
+        // don't care about trimming keep their old headroom.
+        shared_buffer_with_cap(window_samples(44_100, RETAINED_WINDOW))
+    }
+
+    #[test]
+    fn test_window_samples_scales_with_sample_rate() {
+        // The old fixed 22050-sample cap held only 0.459 s at 48 kHz; sizing
+        // from a Duration must hold a full 0.5 s at either rate.
+        assert_eq!(window_samples(44_100, RETAINED_WINDOW), 22_050);
+        assert_eq!(window_samples(48_000, RETAINED_WINDOW), 24_000);
+    }
+
+    #[test]
+    fn test_push_mono_frames_trims_to_configured_window() {
+        // A 48 kHz buffer must retain 0.5 s = 24000 samples, not the legacy
+        // 22050 ceiling that dropped ~41 ms of every window at 48 kHz.
+        let cap = window_samples(48_000, RETAINED_WINDOW);
+        assert_eq!(cap, 24_000);
+
+        let mut buf = shared_buffer_with_cap(cap);
+        push_mono_frames(&mut buf, &vec![0.0f32; cap + 500], 1);
+
+        assert_eq!(buf.samples.len(), cap);
     }
 
     #[test]
@@ -367,15 +419,16 @@ mod tests {
 
     #[test]
     fn test_push_mono_frames_trims_to_window() {
-        let mut buf = empty_shared_buffer();
+        let cap = window_samples(44_100, RETAINED_WINDOW);
+        let mut buf = shared_buffer_with_cap(cap);
 
-        push_mono_frames(&mut buf, &vec![0.0f32; MAX_BUFFER_SAMPLES], 1);
+        push_mono_frames(&mut buf, &vec![0.0f32; cap], 1);
         push_mono_frames(&mut buf, &[1.0f32, 2.0, 3.0], 1);
 
-        assert_eq!(buf.samples.len(), MAX_BUFFER_SAMPLES);
+        assert_eq!(buf.samples.len(), cap);
         // Newest samples survive at the back; oldest were trimmed.
-        assert_eq!(buf.samples[MAX_BUFFER_SAMPLES - 1], 3.0);
-        assert_eq!(buf.samples[MAX_BUFFER_SAMPLES - 3], 1.0);
+        assert_eq!(buf.samples[cap - 1], 3.0);
+        assert_eq!(buf.samples[cap - 3], 1.0);
     }
 
     #[test]
