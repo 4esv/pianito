@@ -1,9 +1,9 @@
 //! Tuning order logic for stable piano tuning.
 //!
 //! Traditional piano tuning follows a specific order for stability:
-//! 1. Temperament octave (F3-F4): 12 notes that form the foundation
-//! 2. Octaves upward (F4→C8): Each note tuned as octave from below
-//! 3. Octaves downward (F3→A0): Each note tuned as octave from above
+//! 1. Temperament octave (F3-F4): 13 notes that form the foundation
+//! 2. Octaves upward (F#4→C8): 43 notes, each tuned as octave from below
+//! 3. Octaves downward (E3→A0): 32 notes, each tuned as octave from above
 
 use super::notes::{Note, NOTES};
 use super::profile::PianoProfile;
@@ -36,7 +36,7 @@ impl TuningOrder {
     /// Generate the traditional tuning order.
     ///
     /// Order:
-    /// 1. Temperament octave (F3-F4): 12 notes, indices 32-44
+    /// 1. Temperament octave (F3-F4): 13 notes, indices 32-44
     /// 2. Octaves upward (F#4→C8): indices 45-87
     /// 3. Octaves downward (E3→A0): indices 31-0
     fn generate_order() -> Vec<usize> {
@@ -125,7 +125,8 @@ impl TuningOrder {
     ///
     /// Order:
     /// 1. Temperament octave (F3-F4): 13 notes, always first
-    /// 2. Remaining 75 notes sorted by absolute cents deviation (worst first)
+    /// 2. Unmeasured notes in chromatic order (unknown deviation, treated as worst)
+    /// 3. Measured notes sorted by absolute cents deviation (worst first)
     pub fn from_profile(profile: &PianoProfile) -> Self {
         let mut order = Vec::with_capacity(88);
 
@@ -143,10 +144,17 @@ impl TuningOrder {
                 continue;
             }
 
-            let deviation = profile.notes[i]
-                .as_ref()
+            // NOTE: unmeasured notes (skipped during profiling, or detection
+            // failed) have unknown deviation. Treat them as worst so they sort
+            // ahead of every measured note — the stable sort keeps them in
+            // chromatic order among themselves. `.get()` guards against profile
+            // files deserialized with fewer than 88 slots.
+            let deviation = profile
+                .notes
+                .get(i)
+                .and_then(|n| n.as_ref())
                 .map(|n| n.cents.abs())
-                .unwrap_or(0.0);
+                .unwrap_or(f32::INFINITY);
 
             remaining.push((i, deviation));
         }
@@ -275,7 +283,7 @@ mod tests {
         // Downward phase starts at position 56
         let downward_start = 13 + 43;
 
-        for i in downward_start..(87) {
+        for i in downward_start..87 {
             let current = notes[i].midi;
             let next = notes[i + 1].midi;
             assert_eq!(
@@ -344,5 +352,93 @@ mod tests {
         assert_eq!(order.phase_name(55), "Octaves Up");
         assert_eq!(order.phase_name(56), "Octaves Down");
         assert_eq!(order.phase_name(87), "Octaves Down");
+    }
+
+    /// Build a profile with every note measured at the given deviation.
+    fn full_profile(cents: f32) -> PianoProfile {
+        let mut profile = PianoProfile::new();
+        for note in NOTES.iter() {
+            profile.record_note(note.midi, 440.0, cents);
+        }
+        profile
+    }
+
+    #[test]
+    fn test_from_profile_temperament_octave_always_first() {
+        let mut profile = full_profile(1.0);
+        // A3 (index 36) sits inside the temperament octave; even as the
+        // worst note on the piano it must not jump the queue.
+        profile.record_note(57, 220.0, -40.0);
+
+        let order = TuningOrder::from_profile(&profile);
+        let temperament: Vec<usize> = (F3_INDEX..=F4_INDEX).collect();
+        assert_eq!(&order.indices()[..13], temperament.as_slice());
+    }
+
+    #[test]
+    fn test_from_profile_sorts_measured_notes_worst_first() {
+        let mut profile = full_profile(0.0);
+        profile.record_note(21, 27.0, -30.0); // A0, index 0
+        profile.record_note(108, 4190.0, 12.0); // C8, index 87
+        profile.record_note(72, 522.0, -5.0); // C5, index 51
+
+        let order = TuningOrder::from_profile(&profile);
+        let indices = order.indices();
+        assert_eq!(indices[13], 0, "A0 (30 cents) first after temperament");
+        assert_eq!(indices[14], 87, "C8 (12 cents) second");
+        assert_eq!(indices[15], 51, "C5 (5 cents) third");
+    }
+
+    #[test]
+    fn test_from_profile_unmeasured_notes_before_measured() {
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -30.0); // A0, index 0
+        profile.record_note(108, 4190.0, 12.0); // C8, index 87
+        profile.record_note(72, 522.0, -5.0); // C5, index 51
+
+        let order = TuningOrder::from_profile(&profile);
+        let indices = order.indices();
+
+        // Temperament octave first.
+        let temperament: Vec<usize> = (F3_INDEX..=F4_INDEX).collect();
+        assert_eq!(&indices[..13], temperament.as_slice());
+
+        // Then every unmeasured note, in chromatic order.
+        let unmeasured: Vec<usize> = (0..88)
+            .filter(|i| !(F3_INDEX..=F4_INDEX).contains(i))
+            .filter(|&i| profile.notes[i].is_none())
+            .collect();
+        assert_eq!(&indices[13..13 + unmeasured.len()], unmeasured.as_slice());
+
+        // Measured notes last, worst first.
+        assert_eq!(&indices[13 + unmeasured.len()..], &[0, 87, 51]);
+    }
+
+    #[test]
+    fn test_from_profile_includes_all_notes_exactly_once() {
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -30.0);
+        profile.record_note(57, 220.0, -40.0);
+
+        let order = TuningOrder::from_profile(&profile);
+        let mut seen = [false; 88];
+        for &idx in order.indices() {
+            assert!(!seen[idx], "Note {} appears twice", idx);
+            seen[idx] = true;
+        }
+        for (i, &s) in seen.iter().enumerate() {
+            assert!(s, "Note {} is missing", i);
+        }
+    }
+
+    #[test]
+    fn test_from_profile_truncated_notes_vec_does_not_panic() {
+        // A hand-edited or corrupted profile file can deserialize with fewer
+        // than 88 slots; from_profile must not index out of bounds.
+        let mut profile = PianoProfile::new();
+        profile.notes.truncate(40);
+
+        let order = TuningOrder::from_profile(&profile);
+        assert_eq!(order.len(), 88);
     }
 }

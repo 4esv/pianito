@@ -146,28 +146,69 @@ impl WavAudioSource<std::io::BufReader<std::fs::File>> {
     }
 }
 
+/// Average interleaved frames of `channels` samples down to mono, filling
+/// `buffer`. Returns the number of mono samples written.
+fn downmix_to_mono(
+    mut samples: impl Iterator<Item = f32>,
+    channels: usize,
+    buffer: &mut [f32],
+) -> usize {
+    if channels == 0 {
+        return 0;
+    }
+
+    let mut count = 0;
+    while count < buffer.len() {
+        let mut sum = 0.0;
+        let mut got = 0;
+        for _ in 0..channels {
+            match samples.next() {
+                Some(s) => {
+                    sum += s;
+                    got += 1;
+                }
+                None => break,
+            }
+        }
+        if got == 0 {
+            break;
+        }
+        buffer[count] = sum / got as f32;
+        count += 1;
+    }
+
+    count
+}
+
 impl<R: Read + Seek + Send> AudioSource for WavAudioSource<R> {
     fn read_samples(&mut self, buffer: &mut [f32]) -> usize {
         let spec = self.reader.spec();
-        let mut count = 0;
+        // NOTE: hound yields samples interleaved across channels; average each
+        // frame to mono, otherwise a stereo file reads stretched 2x in time
+        // and every pitch detects exactly one octave low.
+        let channels = spec.channels as usize;
 
         match spec.sample_format {
             hound::SampleFormat::Float => {
-                for s in self.reader.samples::<f32>().take(buffer.len()).flatten() {
-                    buffer[count] = s;
-                    count += 1;
-                }
+                let samples = self.reader.samples::<f32>().map_while(Result::ok);
+                downmix_to_mono(samples, channels, buffer)
             }
             hound::SampleFormat::Int => {
-                let max_val = (1 << (spec.bits_per_sample - 1)) as f32;
-                for s in self.reader.samples::<i32>().take(buffer.len()).flatten() {
-                    buffer[count] = s as f32 / max_val;
-                    count += 1;
+                // WARNING: hound accepts WAVE_FORMAT_EXTENSIBLE headers whose
+                // wValidBitsPerSample exceeds 32; shifting by that overflows
+                // (a panic in debug builds), so reject such files instead.
+                if !(1..=32).contains(&spec.bits_per_sample) {
+                    return 0;
                 }
+                let max_val = (1u64 << (spec.bits_per_sample - 1)) as f32;
+                let samples = self
+                    .reader
+                    .samples::<i32>()
+                    .map_while(Result::ok)
+                    .map(|s| s as f32 / max_val);
+                downmix_to_mono(samples, channels, buffer)
             }
         }
-
-        count
     }
 
     fn sample_rate(&self) -> u32 {
@@ -247,5 +288,169 @@ mod tests {
         sink.write_samples(&[0.1, 0.2]);
         sink.write_samples(&[0.3, 0.4]);
         assert_eq!(sink.samples(), &[0.1, 0.2, 0.3, 0.4]);
+    }
+
+    /// Write an in-memory 16-bit WAV with the given channel count, duplicating
+    /// the sine value across all channels of each frame.
+    fn wav_sine_i16(frequency: f32, duration: f32, sample_rate: u32, channels: u16) -> Vec<u8> {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for i in 0..(sample_rate as f32 * duration) as usize {
+            let t = i as f32 / sample_rate as f32;
+            let s = (2.0 * std::f32::consts::PI * frequency * t).sin();
+            let v = (s * i16::MAX as f32) as i16;
+            for _ in 0..channels {
+                writer.write_sample(v).unwrap();
+            }
+        }
+        writer.finalize().unwrap();
+
+        cursor.into_inner()
+    }
+
+    #[test]
+    fn test_downmix_to_mono_averages_frames() {
+        let interleaved = [0.8f32, 0.2, -0.4, -0.6, 1.0]; // trailing partial frame
+        let mut buffer = [0.0f32; 4];
+
+        let count = downmix_to_mono(interleaved.iter().copied(), 2, &mut buffer);
+
+        assert_eq!(count, 3);
+        assert!((buffer[0] - 0.5).abs() < 1e-6);
+        assert!((buffer[1] + 0.5).abs() < 1e-6);
+        assert!((buffer[2] - 1.0).abs() < 1e-6); // partial frame: average of what's there
+    }
+
+    #[test]
+    fn test_wav_mono_int_reads_normalized() {
+        let bytes = wav_sine_i16(440.0, 0.05, 44100, 1);
+        let mut source = WavAudioSource::new(std::io::Cursor::new(bytes)).unwrap();
+
+        let mut buffer = vec![0.0f32; 2205];
+        let read = source.read_samples(&mut buffer);
+
+        assert_eq!(read, 2205);
+        let max = buffer.iter().cloned().fold(0.0_f32, f32::max);
+        assert!(max > 0.9, "expected near full scale, got {}", max);
+    }
+
+    #[test]
+    fn test_wav_stereo_downmixes_one_sample_per_frame() {
+        let bytes = wav_sine_i16(440.0, 0.05, 44100, 2);
+        let mut source = WavAudioSource::new(std::io::Cursor::new(bytes)).unwrap();
+
+        // 0.05s at 44.1kHz = 2205 frames; a stereo file must yield 2205 mono
+        // samples, not 4410 interleaved ones.
+        let mut buffer = vec![0.0f32; 4410];
+        let read = source.read_samples(&mut buffer);
+        assert_eq!(read, 2205);
+    }
+
+    #[test]
+    fn test_wav_stereo_detects_correct_octave() {
+        // Regression: interleaved stereo used to read stretched 2x in time,
+        // so a 440 Hz file detected as 220 Hz (one octave low).
+        let bytes = wav_sine_i16(440.0, 0.2, 44100, 2);
+        let mut source = WavAudioSource::new(std::io::Cursor::new(bytes)).unwrap();
+
+        let mut buffer = vec![0.0f32; 8820];
+        let read = source.read_samples(&mut buffer);
+        assert_eq!(read, 8820);
+
+        let result = crate::audio::PitchDetector::new(44100)
+            .detect(&buffer[..read])
+            .expect("should detect pitch in stereo WAV");
+        assert!(
+            (result.frequency - 440.0).abs() < 2.0,
+            "expected ~440Hz, got {}",
+            result.frequency
+        );
+    }
+
+    #[test]
+    fn test_wav_stereo_float_averages_channels() {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44100,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(&mut cursor, spec).unwrap();
+        for _ in 0..100 {
+            writer.write_sample(0.8f32).unwrap();
+            writer.write_sample(0.2f32).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let mut source = WavAudioSource::new(std::io::Cursor::new(cursor.into_inner())).unwrap();
+        let mut buffer = [0.0f32; 200];
+        let read = source.read_samples(&mut buffer);
+
+        assert_eq!(read, 100);
+        for &s in &buffer[..100] {
+            assert!(
+                (s - 0.5).abs() < 1e-6,
+                "expected L/R average 0.5, got {}",
+                s
+            );
+        }
+    }
+
+    /// Hand-craft a WAVE_FORMAT_EXTENSIBLE file whose wValidBitsPerSample
+    /// exceeds the container size; hound 3.5 accepts it and reports the raw
+    /// value as `bits_per_sample`.
+    fn extensible_wav_with_valid_bits(valid_bits: u16) -> Vec<u8> {
+        let mut b: Vec<u8> = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&0u32.to_le_bytes()); // placeholder, patched below
+        b.extend_from_slice(b"WAVE");
+        // fmt chunk (WAVEFORMATEXTENSIBLE, 40 bytes)
+        b.extend_from_slice(b"fmt ");
+        b.extend_from_slice(&40u32.to_le_bytes());
+        b.extend_from_slice(&0xFFFEu16.to_le_bytes()); // wFormatTag: EXTENSIBLE
+        b.extend_from_slice(&1u16.to_le_bytes()); // nChannels
+        b.extend_from_slice(&44100u32.to_le_bytes()); // nSamplesPerSec
+        b.extend_from_slice(&88200u32.to_le_bytes()); // nAvgBytesPerSec
+        b.extend_from_slice(&2u16.to_le_bytes()); // nBlockAlign
+        b.extend_from_slice(&16u16.to_le_bytes()); // wBitsPerSample
+        b.extend_from_slice(&22u16.to_le_bytes()); // cbSize
+        b.extend_from_slice(&valid_bits.to_le_bytes()); // wValidBitsPerSample
+        b.extend_from_slice(&0u32.to_le_bytes()); // dwChannelMask
+                                                  // KSDATAFORMAT_SUBTYPE_PCM
+        b.extend_from_slice(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ]);
+        // data chunk: two 16-bit samples
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&1000i16.to_le_bytes());
+        b.extend_from_slice(&(-1000i16).to_le_bytes());
+        // Patch RIFF chunk size
+        let riff_size = (b.len() - 8) as u32;
+        b[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn test_wav_oversized_valid_bits_does_not_panic() {
+        // Regression: `1 << (bits_per_sample - 1)` overflowed (debug panic)
+        // when a crafted EXTENSIBLE header claimed more than 32 valid bits.
+        for valid_bits in [64u16, 999] {
+            let bytes = extensible_wav_with_valid_bits(valid_bits);
+            let mut source =
+                WavAudioSource::new(std::io::Cursor::new(bytes)).expect("hound accepts the header");
+
+            let mut buffer = [0.0f32; 16];
+            assert_eq!(source.read_samples(&mut buffer), 0);
+        }
     }
 }
