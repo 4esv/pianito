@@ -10,6 +10,7 @@ license = "MIT"
 cpal = "0.15"
 dasp = { version = "0.11", features = ["signal", "ring_buffer"] }
 hound = "3.5"
+rustfft = "6"
 
 # Terminal UI
 ratatui = "0.29"
