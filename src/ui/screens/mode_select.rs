@@ -56,6 +56,11 @@ impl ModeSelectScreen {
         self.selected
     }
 
+    /// Preselect a mode (used to honor the configured default mode).
+    pub fn select(&mut self, mode: SelectedMode) {
+        self.selected = mode;
+    }
+
     /// Select the next mode.
     pub fn next(&mut self) {
         self.selected = match self.selected {

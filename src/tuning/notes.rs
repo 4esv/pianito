@@ -44,7 +44,14 @@ impl Note {
 
     /// Get note by name (e.g., "A4", "C#5").
     pub fn from_name(name: &str) -> Option<&'static Note> {
-        NOTES.iter().find(|n| n.display_name() == name)
+        // PERF: parse name/octave instead of allocating a display_name
+        // String per note while scanning.
+        let digit_pos = name.find(|c: char| c.is_ascii_digit())?;
+        let (note_name, octave_str) = name.split_at(digit_pos);
+        let octave: i8 = octave_str.parse().ok()?;
+        NOTES
+            .iter()
+            .find(|n| n.name == note_name && n.octave == octave)
     }
 }
 
@@ -176,6 +183,18 @@ mod tests {
 
         let csharp5 = Note::from_name("C#5").expect("C#5 should exist");
         assert_eq!(csharp5.midi, 73);
+
+        // Every display name round-trips.
+        for note in NOTES.iter() {
+            let found = Note::from_name(&note.display_name()).expect("round-trip");
+            assert_eq!(found.midi, note.midi);
+        }
+
+        // Invalid names return None.
+        assert!(Note::from_name("").is_none());
+        assert!(Note::from_name("A").is_none());
+        assert!(Note::from_name("X4").is_none());
+        assert!(Note::from_name("A9").is_none());
     }
 
     #[test]
