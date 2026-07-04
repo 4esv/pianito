@@ -4,12 +4,20 @@ version = "0.1.0"
 edition = "2021"
 description = "CLI piano tuner with guided coaching and real-time visual feedback"
 license = "MIT"
+repository = "https://github.com/4esv/pianito"
+homepage = "https://github.com/4esv/pianito"
+readme = "README.md"
+keywords = ["piano", "tuner", "tuning", "tui", "audio"]
+categories = ["command-line-utilities", "multimedia::audio"]
+rust-version = "1.82"
+include = ["src/**", "Cargo.toml", "LICENSE", "README.md"]
 
 [dependencies]
 # Audio I/O
 cpal = "0.15"
 dasp = { version = "0.11", features = ["signal", "ring_buffer"] }
 hound = "3.5"
+rustfft = "6"
 
 # Terminal UI
 ratatui = "0.29"
