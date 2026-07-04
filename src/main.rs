@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use pianito::audio::{AudioOutput, AudioSource, MicCapture, PitchDetector, WavAudioSource};
+use pianito::audio::{
+    AudioOutput, AudioSource, MedianFilter, MicCapture, PitchDetector, WavAudioSource,
+};
 use pianito::config::{Args, Command, Config};
 use pianito::tuning::notes::Note;
 use pianito::tuning::session::Session;
@@ -249,6 +251,9 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     // Main loop
     let mut audio_buffer = vec![0.0f32; sample_rate as usize / 10]; // 100ms buffer
 
+    // Reject isolated octave-off / glitch frames before they reach the meter.
+    let mut pitch_filter = MedianFilter::new(MedianFilter::DEFAULT_WINDOW);
+
     let result = loop {
         // Surface mic stream errors (e.g. device unplugged) in the UI
         // status line instead of writing to stderr while the terminal is
@@ -266,8 +271,12 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
         let read = mic.read_samples(&mut audio_buffer);
         if read > 0 {
             if let Some(pitch_result) = detector.detect(&audio_buffer[..read]) {
-                app.update_pitch(pitch_result.frequency, pitch_result.confidence);
+                let smoothed = pitch_filter.push(pitch_result.frequency);
+                app.update_pitch(smoothed, pitch_result.confidence);
             } else {
+                // Silence/lost detection re-arms the window so the next strike
+                // starts clean instead of blending across the gap.
+                pitch_filter.clear();
                 app.clear_pitch();
             }
         }
