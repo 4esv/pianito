@@ -10,6 +10,17 @@ pub struct Temperament {
 }
 
 impl Temperament {
+    /// Sentinel returned by `cents_from_target` for non-positive input.
+    /// Finite (unlike NaN/inf) and far beyond any real tuning tolerance, so
+    /// `cents.abs() <= tolerance` checks downstream stay correct instead of
+    /// mistaking a degenerate reading for "in tune".
+    const INVALID_CENTS_SENTINEL: f32 = 9999.0;
+
+    /// Lowest MIDI note on an 88-key piano (A0).
+    const MIDI_MIN: u8 = 21;
+    /// Highest MIDI note on an 88-key piano (C8).
+    const MIDI_MAX: u8 = 108;
+
     /// Create a new temperament with A4 = 440 Hz.
     pub fn new() -> Self {
         Self { a4_freq: 440.0 }
@@ -39,7 +50,16 @@ impl Temperament {
 
     /// Convert a frequency to cents deviation from a target frequency.
     /// Positive = sharp, negative = flat.
+    ///
+    /// NOTE: log2(frequency / target) is undefined for non-positive input
+    /// (NaN for a negative ratio, -inf at zero). A degenerate pitch reading
+    /// must not leak NaN/inf into tolerance comparisons or displayed cents,
+    /// so non-positive input is reported as maximally sharp (a large but
+    /// finite sentinel, well outside any real tuning tolerance) instead.
     pub fn cents_from_target(&self, frequency: f32, target: f32) -> f32 {
+        if frequency <= 0.0 || target <= 0.0 {
+            return Self::INVALID_CENTS_SENTINEL;
+        }
         1200.0 * (frequency / target).log2()
     }
 
@@ -61,17 +81,32 @@ impl Temperament {
     }
 
     /// Find the nearest MIDI note for a given frequency.
-    /// Returns (midi_note, cents_deviation).
-    pub fn nearest_note(&self, frequency: f32) -> (u8, f32) {
+    /// Returns `Some((midi_note, cents_deviation))`, or `None` if the
+    /// frequency falls outside the 88-key piano span (MIDI 21 A0 - 108 C8).
+    ///
+    /// NOTE: `midi_float.round() as u8` used to be the whole implementation,
+    /// but that cast *saturates* rather than erroring: non-positive/NaN
+    /// frequencies became MIDI 0, and very high frequencies clamped to 255.
+    /// Both are silently-wrong notes rather than "out of range" - checking
+    /// `is_finite()` and the 21-108 span explicitly turns those into `None`.
+    pub fn nearest_note(&self, frequency: f32) -> Option<(u8, f32)> {
         // Calculate fractional MIDI note
         let midi_float = 69.0 + 12.0 * (frequency / self.a4_freq).log2();
-        let midi_note = midi_float.round() as u8;
+        if !midi_float.is_finite() {
+            return None;
+        }
+
+        let midi_rounded = midi_float.round();
+        if midi_rounded < Self::MIDI_MIN as f32 || midi_rounded > Self::MIDI_MAX as f32 {
+            return None;
+        }
+        let midi_note = midi_rounded as u8;
 
         // Calculate cents deviation
         let target_freq = self.frequency(midi_note);
         let cents = self.cents_from_target(frequency, target_freq);
 
-        (midi_note, cents)
+        Some((midi_note, cents))
     }
 }
 
@@ -309,6 +344,27 @@ mod tests {
         );
     }
 
+    // NOTE: issue #16 - `cents_from_target` computes `log2(frequency /
+    // target)`, which is undefined for non-positive input: negative
+    // frequency yields NaN, zero yields -inf. A degenerate pitch reading
+    // (e.g. from a YIN edge case) must not propagate NaN/inf into the UI's
+    // tolerance comparisons and displayed cents.
+    #[test]
+    fn test_cents_from_target_guards_non_positive_frequency() {
+        let temp = Temperament::new();
+
+        assert!(temp.cents_from_target(0.0, 440.0).is_finite());
+        assert!(temp.cents_from_target(-10.0, 440.0).is_finite());
+    }
+
+    #[test]
+    fn test_cents_from_target_guards_non_positive_target() {
+        let temp = Temperament::new();
+
+        assert!(temp.cents_from_target(440.0, 0.0).is_finite());
+        assert!(temp.cents_from_target(440.0, -10.0).is_finite());
+    }
+
     #[test]
     fn test_cents_roundtrip() {
         let temp = Temperament::new();
@@ -332,24 +388,78 @@ mod tests {
         let temp = Temperament::new();
 
         // Exact A4
-        let (midi, cents) = temp.nearest_note(440.0);
+        let (midi, cents) = temp.nearest_note(440.0).expect("A4 is in range");
         assert_eq!(midi, 69);
         assert!(cents.abs() < 0.1);
 
         // A4 + 25 cents
         let freq = temp.cents_to_frequency(440.0, 25.0);
-        let (midi, cents) = temp.nearest_note(freq);
+        let (midi, cents) = temp.nearest_note(freq).expect("in range");
         assert_eq!(midi, 69);
         assert!((cents - 25.0).abs() < 0.1);
 
         // Between A4 and A#4 (should round to nearest)
         let freq = temp.cents_to_frequency(440.0, 49.0);
-        let (midi, _) = temp.nearest_note(freq);
+        let (midi, _) = temp.nearest_note(freq).expect("in range");
         assert_eq!(midi, 69); // Still A4
 
         let freq = temp.cents_to_frequency(440.0, 51.0);
-        let (midi, _) = temp.nearest_note(freq);
+        let (midi, _) = temp.nearest_note(freq).expect("in range");
         assert_eq!(midi, 70); // A#4
+    }
+
+    // NOTE: issue #16 - `nearest_note` used to do `midi_float.round() as u8`,
+    // which *saturates* out-of-range floats instead of erroring: anything
+    // below ~8.66Hz (or negative/NaN) became MIDI 0, and very high input
+    // clamped to 255. Both are outside the 88-key piano span (21-108) and
+    // should be reported as such, not silently mapped to a bogus note.
+    #[test]
+    fn test_nearest_note_rejects_below_piano_range() {
+        let temp = Temperament::new();
+
+        // Cited directly in the issue: sub-8.7Hz used to become MIDI 0 (A0-ish).
+        assert_eq!(temp.nearest_note(8.0), None);
+
+        // Just below A0 (MIDI 21 = 27.5Hz) should also be out of range, not
+        // silently rounded down into a neighboring in-range note.
+        assert_eq!(temp.nearest_note(20.0), None);
+    }
+
+    #[test]
+    fn test_nearest_note_rejects_above_piano_range() {
+        let temp = Temperament::new();
+
+        // Comfortably above C8 (MIDI 108 = 4186.009Hz).
+        assert_eq!(temp.nearest_note(5000.0), None);
+
+        // A frequency high enough that the old `as u8` cast would have
+        // saturated to 255 instead of erroring.
+        assert_eq!(temp.nearest_note(1_000_000.0), None);
+    }
+
+    #[test]
+    fn test_nearest_note_rejects_non_positive_frequency() {
+        let temp = Temperament::new();
+
+        // log2(0/target) = -inf; the old cast saturated this to MIDI 0.
+        assert_eq!(temp.nearest_note(0.0), None);
+        // log2(negative) = NaN; the old cast also saturated this to MIDI 0.
+        assert_eq!(temp.nearest_note(-100.0), None);
+    }
+
+    #[test]
+    fn test_nearest_note_boundary_a0_and_c8() {
+        let temp = Temperament::new();
+
+        // Exactly A0 (MIDI 21, low end of the 88-key span) must be in range.
+        let (midi, cents) = temp.nearest_note(27.5).expect("A0 is in range");
+        assert_eq!(midi, 21);
+        assert!(cents.abs() < 1.0);
+
+        // Exactly C8 (MIDI 108, high end of the 88-key span) must be in range.
+        let (midi, cents) = temp.nearest_note(4186.009).expect("C8 is in range");
+        assert_eq!(midi, 108);
+        assert!(cents.abs() < 1.0);
     }
 
     #[test]
