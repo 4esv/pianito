@@ -32,6 +32,54 @@ fn window_samples(sample_rate: u32, window: Duration) -> usize {
     (sample_rate as f64 * window.as_secs_f64()).round() as usize
 }
 
+/// Analysis frame for the energy-based onset detector (~5.8 ms at 44.1 kHz).
+const ONSET_FRAME_LEN: usize = 256;
+/// A frame is a strike onset when its short-term energy jumps to at least this
+/// multiple of the previous frame's energy.
+const ONSET_RISE: f32 = 4.0;
+/// ...and also clears this absolute energy floor, so quiet noise-floor ratios
+/// (0 -> tiny) don't register as strikes.
+const ONSET_ENERGY_FLOOR: f32 = 1e-4;
+
+/// Index of the first frame whose short-term energy rises sharply above the
+/// previous frame — the attack of a strike. Returns `None` when there is no
+/// clear energy edge (silence, or a steady sustained tone).
+///
+/// Consumes an iterator so it can scan a `VecDeque` in logical order without
+/// allocating or making it contiguous.
+fn energy_onset(samples: impl Iterator<Item = f32>, frame_len: usize) -> Option<usize> {
+    if frame_len == 0 {
+        return None;
+    }
+
+    let mut prev_energy: Option<f32> = None;
+    let mut frame_start = 0usize;
+    let mut idx = 0usize;
+    let mut sum_sq = 0.0f32;
+    let mut count = 0usize;
+
+    for s in samples {
+        sum_sq += s * s;
+        count += 1;
+        idx += 1;
+
+        if count == frame_len {
+            let energy = sum_sq / frame_len as f32;
+            if let Some(prev) = prev_energy {
+                if energy > ONSET_ENERGY_FLOOR && energy >= ONSET_RISE * prev {
+                    return Some(frame_start);
+                }
+            }
+            prev_energy = Some(energy);
+            frame_start = idx;
+            sum_sq = 0.0;
+            count = 0;
+        }
+    }
+
+    None
+}
+
 /// Shared buffer for audio samples.
 struct SharedBuffer {
     samples: VecDeque<f32>,
@@ -62,27 +110,38 @@ where
     buf.new_data = true;
 }
 
-/// Copy the most recent samples (sliding window) into `buffer`.
-fn copy_latest(samples: &VecDeque<f32>, buffer: &mut [f32]) -> usize {
+/// Copy up to `buffer.len()` samples beginning at logical index `start`
+/// (clamped to the deque length) into `buffer`. Returns the number written.
+///
+/// NOTE: the deque may wrap; copy from both backing slices instead of
+/// make_contiguous so the read path never shuffles elements.
+fn copy_from(samples: &VecDeque<f32>, start: usize, buffer: &mut [f32]) -> usize {
     let available = samples.len();
-    let to_read = buffer.len().min(available);
+    if start >= available {
+        return 0;
+    }
+    let to_read = buffer.len().min(available - start);
+    if to_read == 0 {
+        return 0;
+    }
 
-    if to_read > 0 {
-        let start = available - to_read;
-        // NOTE: the deque may wrap; copy from both backing slices instead of
-        // make_contiguous so the read path never shuffles elements.
-        let (front, back) = samples.as_slices();
-        if start < front.len() {
-            let n = (front.len() - start).min(to_read);
-            buffer[..n].copy_from_slice(&front[start..start + n]);
-            buffer[n..to_read].copy_from_slice(&back[..to_read - n]);
-        } else {
-            let bstart = start - front.len();
-            buffer[..to_read].copy_from_slice(&back[bstart..bstart + to_read]);
-        }
+    let (front, back) = samples.as_slices();
+    if start < front.len() {
+        let n = (front.len() - start).min(to_read);
+        buffer[..n].copy_from_slice(&front[start..start + n]);
+        buffer[n..to_read].copy_from_slice(&back[..to_read - n]);
+    } else {
+        let bstart = start - front.len();
+        buffer[..to_read].copy_from_slice(&back[bstart..bstart + to_read]);
     }
 
     to_read
+}
+
+/// Copy the most recent samples (sliding window) into `buffer`.
+fn copy_latest(samples: &VecDeque<f32>, buffer: &mut [f32]) -> usize {
+    let start = samples.len().saturating_sub(buffer.len());
+    copy_from(samples, start, buffer)
 }
 
 /// Fill an interleaved output buffer from queued mono samples, zero-filling
@@ -171,6 +230,33 @@ impl MicCapture {
     /// Wall-clock audio retained in the ring buffer at the device sample rate.
     pub fn retained_duration(&self) -> Duration {
         Duration::from_secs_f64(self.max_samples as f64 / self.sample_rate as f64)
+    }
+
+    /// Onset-aware read for long-window (bass) analysis: copy the retained
+    /// window starting `skip` after the most recent detected strike so the
+    /// attack transient doesn't bias a long estimate. Falls back to the plain
+    /// latest window when no onset is present. Returns samples written.
+    ///
+    /// PERF: onset scanning and the copy run here on the read thread, never in
+    /// the cpal callback — the audio hot path stays allocation- and scan-free.
+    pub fn read_after_onset(&mut self, buffer: &mut [f32], skip: Duration) -> usize {
+        let mut buf = self.buffer.lock().unwrap();
+
+        if !buf.new_data {
+            return 0;
+        }
+
+        let start = match energy_onset(buf.samples.iter().copied(), ONSET_FRAME_LEN) {
+            Some(onset) => {
+                let skip_samples = window_samples(self.sample_rate, skip);
+                (onset + skip_samples).min(buf.samples.len())
+            }
+            None => buf.samples.len().saturating_sub(buffer.len()),
+        };
+
+        let to_read = copy_from(&buf.samples, start, buffer);
+        buf.new_data = false;
+        to_read
     }
 
     fn build_stream<T>(
@@ -472,5 +558,95 @@ mod tests {
         fill_output_frames(&mut data, 2, &mut queued);
 
         assert_eq!(data, [16384, 16384, -16384, -16384, 0, 0]);
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn test_energy_onset_locates_the_strike() {
+        // 4000 samples of silence, then a loud 440 Hz strike. The onset must
+        // land within one analysis frame of the true attack, not before it.
+        let mut sig = vec![0.0f32; 4000];
+        for i in 0..8000 {
+            let t = i as f32 / 44_100.0;
+            sig.push(0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+
+        let onset = energy_onset(sig.iter().copied(), ONSET_FRAME_LEN).expect("onset detected");
+
+        assert!(
+            onset <= 4000 && 4000 - onset <= ONSET_FRAME_LEN,
+            "onset {} not within one frame before the true attack at 4000",
+            onset
+        );
+    }
+
+    #[test]
+    fn test_energy_onset_none_on_steady_signal() {
+        // A steady tone has no energy edge, so no onset.
+        let mut sig = Vec::new();
+        for i in 0..8000 {
+            let t = i as f32 / 44_100.0;
+            sig.push(0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+        assert!(energy_onset(sig.iter().copied(), ONSET_FRAME_LEN).is_none());
+    }
+
+    #[test]
+    fn test_onset_aware_read_skips_stale_pre_onset_samples() {
+        // Buffer holds a stale/decayed region (4000 silent samples) followed
+        // by a fresh 8000-sample strike. A naive latest-window read long
+        // enough for bass reaches back across the onset and blends in the
+        // stale samples; an onset-aware read that skips 50 ms past the strike
+        // sees only the fresh note, so its RMS stays at the pure-tone level.
+        let mut dq: VecDeque<f32> = VecDeque::new();
+        for _ in 0..4000 {
+            dq.push_back(0.0);
+        }
+        for i in 0..8000 {
+            let t = i as f32 / 44_100.0;
+            dq.push_back(0.5 * (2.0 * std::f32::consts::PI * 440.0 * t).sin());
+        }
+
+        let onset = energy_onset(dq.iter().copied(), ONSET_FRAME_LEN).expect("onset");
+        let skip = window_samples(44_100, Duration::from_millis(50)); // 2205
+        let start = onset + skip;
+
+        let mut aware = vec![0.0f32; 4000];
+        let n_aware = copy_from(&dq, start, &mut aware);
+        let rms_aware = rms(&aware[..n_aware]);
+
+        // Naive long window spans the whole buffer, back across the onset.
+        let mut naive = vec![0.0f32; dq.len()];
+        let n_naive = copy_latest(&dq, &mut naive);
+        let rms_naive = rms(&naive[..n_naive]);
+
+        assert!(
+            rms_aware > 0.34,
+            "onset-aware window should be a clean tone (RMS ~0.354), got {}",
+            rms_aware
+        );
+        assert!(
+            rms_naive < rms_aware,
+            "naive window ({}) should be diluted by the stale pre-onset region vs onset-aware ({})",
+            rms_naive,
+            rms_aware
+        );
+    }
+
+    #[test]
+    fn test_copy_from_reads_arbitrary_offset() {
+        let dq: VecDeque<f32> = (0..10).map(|i| i as f32).collect();
+        let mut out = [0.0f32; 3];
+        assert_eq!(copy_from(&dq, 4, &mut out), 3);
+        assert_eq!(out, [4.0, 5.0, 6.0]);
+
+        // Start past the end reads nothing.
+        assert_eq!(copy_from(&dq, 20, &mut out), 0);
     }
 }
