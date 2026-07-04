@@ -1,0 +1,65 @@
+name: Bug report
+description: Something in pianito is broken.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what you got instead.
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: e.g. macOS 14.5, Ubuntu 22.04
+      placeholder: macOS 14.5
+    validations:
+      required: true
+
+  - type: input
+    id: audio-backend
+    attributes:
+      label: Audio backend
+      description: e.g. CoreAudio, ALSA, PulseAudio, JACK
+      placeholder: CoreAudio
+    validations:
+      required: true
+
+  - type: input
+    id: input-device
+    attributes:
+      label: Input device
+      description: Microphone / audio interface make and model
+      placeholder: MacBook Pro built-in microphone
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: Terminal emulator and version
+      placeholder: iTerm2 3.5.x
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: pianito version
+      description: Output of `pianito --version`, or the commit hash if built from source.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Terminal output, error messages, or a screenshot.
+      render: shell
+    validations:
+      required: false
