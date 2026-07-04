@@ -53,7 +53,7 @@ fn analyze_file(path: &str, a4: f32) -> anyhow::Result<()> {
             break;
         }
 
-        if let Some(result) = detector.detect(&buffer[..read]) {
+        if let Ok(result) = detector.detect(&buffer[..read]) {
             let (midi, cents) = temperament.nearest_note(result.frequency);
             if let Some(note) = Note::from_midi(midi) {
                 detections.push((
@@ -265,10 +265,11 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
         // Read audio and detect pitch
         let read = mic.read_samples(&mut audio_buffer);
         if read > 0 {
-            if let Some(pitch_result) = detector.detect(&audio_buffer[..read]) {
-                app.update_pitch(pitch_result.frequency, pitch_result.confidence);
-            } else {
-                app.clear_pitch();
+            match detector.detect(&audio_buffer[..read]) {
+                Ok(pitch_result) => {
+                    app.update_pitch(pitch_result.frequency, pitch_result.confidence);
+                }
+                Err(_) => app.clear_pitch(),
             }
         }
 
