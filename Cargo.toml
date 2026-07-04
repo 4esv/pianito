@@ -9,7 +9,6 @@ license = "MIT"
 # Audio I/O
 cpal = "0.15"
 dasp = { version = "0.11", features = ["signal", "ring_buffer"] }
-rustfft = "6.2"
 hound = "3.5"
 
 # Terminal UI
