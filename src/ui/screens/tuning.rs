@@ -38,6 +38,9 @@ pub struct TuningScreen {
     show_piano_progress: bool,
     /// Set of completed chromatic indices.
     completed_notes: HashSet<usize>,
+    /// In-tune tolerance in cents (from config; drives the meter zone and
+    /// direction hints).
+    tolerance: f32,
 }
 
 impl TuningScreen {
@@ -77,7 +80,13 @@ impl TuningScreen {
             phase_name,
             show_piano_progress: false,
             completed_notes: HashSet::new(),
+            tolerance: 5.0,
         }
+    }
+
+    /// Set the in-tune tolerance in cents.
+    pub fn set_tolerance(&mut self, tolerance: f32) {
+        self.tolerance = tolerance;
     }
 
     /// Toggle piano progress display.
@@ -88,11 +97,6 @@ impl TuningScreen {
     /// Set the completed notes for progress display.
     pub fn set_completed_notes(&mut self, completed: HashSet<usize>) {
         self.completed_notes = completed;
-    }
-
-    /// Get note index.
-    pub fn note_index(&self) -> usize {
-        self.note_index
     }
 
     /// Update with detected pitch.
@@ -110,16 +114,6 @@ impl TuningScreen {
     /// Get current cents deviation.
     pub fn cents(&self) -> f32 {
         self.cents_deviation
-    }
-
-    /// Check if this is a trichord note.
-    pub fn is_trichord(&self) -> bool {
-        self.string_count == 3
-    }
-
-    /// Check if this is a bichord note.
-    pub fn is_bichord(&self) -> bool {
-        self.string_count == 2
     }
 
     /// Check if this note has multiple strings (bichord or trichord).
@@ -154,28 +148,6 @@ impl TuningScreen {
         false
     }
 
-    /// Check if note tuning is complete.
-    pub fn is_complete(&self) -> bool {
-        match self.string_count {
-            3 => {
-                self.tuning_step == Some(TuningStep::TuneRight)
-                    && self.cents_deviation.abs() <= 5.0
-                    && self.detected_freq.is_some()
-            }
-            2 => {
-                self.tuning_step == Some(TuningStep::TuneBichord)
-                    && self.cents_deviation.abs() <= 5.0
-                    && self.detected_freq.is_some()
-            }
-            _ => self.cents_deviation.abs() <= 5.0 && self.detected_freq.is_some(),
-        }
-    }
-
-    /// Get note name.
-    pub fn note_name(&self) -> &str {
-        &self.note_name
-    }
-
     /// Get target frequency.
     pub fn target_freq(&self) -> f32 {
         self.target_freq
@@ -194,7 +166,9 @@ impl Widget for &TuningScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        if inner.height < 15 || inner.width < 40 {
+        // Minimum for the reduced layout below (progress + instructions +
+        // meter + help)
+        if inner.height < 16 || inner.width < 40 {
             let msg = "Terminal too small";
             buf.set_string(inner.x, inner.y, msg, Theme::warning());
             return;
@@ -203,18 +177,32 @@ impl Widget for &TuningScreen {
         // Check if we're in muting step (don't show meter or hints)
         let is_muting_step = self.tuning_step.map(|s| s.is_muting()).unwrap_or(false);
 
-        // Layout - piano at top, instructions, then meter
-        let chunks = Layout::vertical([
-            Constraint::Length(2), // Progress bar
-            Constraint::Length(1), // Spacer
-            Constraint::Length(4), // Piano visualization
-            Constraint::Length(1), // Spacer
-            Constraint::Min(6),    // Instructions
-            Constraint::Length(1), // Spacer
-            Constraint::Length(8), // Meter (hidden during muting)
-            Constraint::Length(2), // Help text
-        ])
-        .split(inner);
+        // Full layout needs 25 rows; below that, drop the piano and spacers
+        // so the meter (the core feedback) keeps its full height.
+        let (progress_area, piano_area, instructions_area, meter_area, help_area) =
+            if inner.height >= 25 {
+                let chunks = Layout::vertical([
+                    Constraint::Length(2), // Progress bar
+                    Constraint::Length(1), // Spacer
+                    Constraint::Length(4), // Piano visualization
+                    Constraint::Length(1), // Spacer
+                    Constraint::Min(6),    // Instructions
+                    Constraint::Length(1), // Spacer
+                    Constraint::Length(8), // Meter (hidden during muting)
+                    Constraint::Length(2), // Help text
+                ])
+                .split(inner);
+                (chunks[0], Some(chunks[2]), chunks[4], chunks[6], chunks[7])
+            } else {
+                let chunks = Layout::vertical([
+                    Constraint::Length(2), // Progress bar
+                    Constraint::Min(4),    // Instructions
+                    Constraint::Length(8), // Meter (hidden during muting)
+                    Constraint::Length(2), // Help text
+                ])
+                .split(inner);
+                (chunks[0], None, chunks[1], chunks[2], chunks[3])
+            };
 
         // Progress indicator
         let progress = Progress::new(
@@ -223,20 +211,21 @@ impl Widget for &TuningScreen {
             &self.note_name,
             &self.phase_name,
         );
-        progress.render(chunks[0], buf);
+        progress.render(progress_area, buf);
 
         // Piano visualization (full 88-key piano, A0=MIDI 21)
-        let piano = if self.show_piano_progress {
-            Piano::full()
-                .highlighted(self.completed_notes.clone())
-                .current(Some(self.chromatic_index))
-        } else {
-            Piano::full().current(Some(self.chromatic_index))
-        };
-        piano.render(chunks[2], buf);
+        if let Some(piano_area) = piano_area {
+            let piano = if self.show_piano_progress {
+                Piano::full()
+                    .highlighted(self.completed_notes.clone())
+                    .current(Some(self.chromatic_index))
+            } else {
+                Piano::full().current(Some(self.chromatic_index))
+            };
+            piano.render(piano_area, buf);
+        }
 
         // Instructions panel
-        let instructions_area = chunks[4];
         if let Some(step) = self.tuning_step {
             // Multi-string note (bichord or trichord)
             let instructions = if is_muting_step {
@@ -244,23 +233,24 @@ impl Widget for &TuningScreen {
                 Instructions::for_step(step, self.string_count)
             } else {
                 Instructions::for_step(step, self.string_count)
-                    .with_direction_hint(self.cents_deviation)
+                    .with_direction_hint(self.cents_deviation, self.tolerance)
             };
             instructions.render(instructions_area, buf);
         } else {
             // Monochord note - simple instruction
-            let instructions = Instructions::simple().with_direction_hint(self.cents_deviation);
+            let instructions =
+                Instructions::simple().with_direction_hint(self.cents_deviation, self.tolerance);
             instructions.render(instructions_area, buf);
         }
 
         // Cents meter (hidden during muting step)
         if !is_muting_step {
             let meter = if self.detected_freq.is_some() {
-                Meter::new(self.cents_deviation)
+                Meter::new(self.cents_deviation).tolerance(self.tolerance)
             } else {
-                Meter::listening()
+                Meter::listening().tolerance(self.tolerance)
             };
-            meter.render(chunks[6], buf);
+            meter.render(meter_area, buf);
         }
 
         // Help text
@@ -275,6 +265,75 @@ impl Widget for &TuningScreen {
         let help = Paragraph::new(help_text)
             .style(Theme::muted())
             .alignment(Alignment::Center);
-        help.render(chunks[7], buf);
+        help.render(help_area, buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_to_string(screen: &TuningScreen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn monochord_screen() -> TuningScreen {
+        // A0 (MIDI 21) is a single-string note: no muting step, meter visible
+        TuningScreen::new("A0", 87, 88, 27.5, 1, 21)
+    }
+
+    #[test]
+    fn test_small_terminal_keeps_meter_and_help() {
+        // Stock 80x24 terminal: inner is 78x22, below the 25-row full layout
+        let screen = monochord_screen();
+        let rendered = render_to_string(&screen, 80, 24);
+
+        assert!(!rendered.contains("Terminal too small"));
+        assert!(rendered.contains("Listening..."), "meter must be visible");
+        assert!(rendered.contains("Confirm"), "help line must be visible");
+        assert!(!rendered.contains('╚'), "piano dropped at this height");
+    }
+
+    #[test]
+    fn test_full_terminal_shows_piano() {
+        let screen = monochord_screen();
+        let rendered = render_to_string(&screen, 110, 30);
+
+        assert!(rendered.contains('╚'), "piano visible");
+        assert!(rendered.contains("Listening..."));
+    }
+
+    #[test]
+    fn test_too_small_terminal_shows_message() {
+        let screen = monochord_screen();
+        let rendered = render_to_string(&screen, 80, 10);
+        assert!(rendered.contains("Terminal too small"));
+    }
+
+    #[test]
+    fn test_configured_tolerance_widens_in_tune_zone() {
+        // +8 cents: out of tune at the default 5-cent tolerance...
+        let mut screen = monochord_screen();
+        screen.update(27.63, 8.0);
+        let rendered = render_to_string(&screen, 80, 24);
+        assert!(rendered.contains("Loosen"), "hint shown outside tolerance");
+
+        // ...but in tune once the configured tolerance is 10 cents
+        screen.set_tolerance(10.0);
+        let rendered = render_to_string(&screen, 80, 24);
+        assert!(
+            !rendered.contains("Loosen") && !rendered.contains("Tighten"),
+            "no hint inside the configured tolerance"
+        );
     }
 }

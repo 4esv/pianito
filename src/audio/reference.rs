@@ -71,7 +71,7 @@ mod tests {
         // Sine wave should be in range [-1, 1]
         assert!(max > 0.99 && max <= 1.0, "max should be ~1.0, got {}", max);
         assert!(
-            min < -0.99 && min >= -1.0,
+            (-1.0..-0.99).contains(&min),
             "min should be ~-1.0, got {}",
             min
         );

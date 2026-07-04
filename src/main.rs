@@ -19,8 +19,10 @@ fn main() -> anyhow::Result<()> {
     let effective = config.merge_with_args(&args);
 
     match args.command {
-        Some(Command::Analyze { file }) => analyze_file(&file)?,
-        Some(Command::Reference { note, duration }) => play_reference(&note, duration)?,
+        Some(Command::Analyze { file }) => analyze_file(&file, effective.a4)?,
+        Some(Command::Reference { note, duration }) => {
+            play_reference(&note, duration, effective.a4)?
+        }
         Some(Command::History) => show_history()?,
         Some(Command::Reset) => reset_sessions()?,
         None => run_interactive(effective)?,
@@ -30,7 +32,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Analyze a WAV file for pitch content.
-fn analyze_file(path: &str) -> anyhow::Result<()> {
+fn analyze_file(path: &str, a4: f32) -> anyhow::Result<()> {
     println!("Analyzing {}...", path);
 
     let file = std::fs::File::open(path)?;
@@ -38,7 +40,7 @@ fn analyze_file(path: &str) -> anyhow::Result<()> {
     let sample_rate = source.sample_rate();
 
     let detector = PitchDetector::new(sample_rate);
-    let temperament = Temperament::new();
+    let temperament = Temperament::with_a4(a4);
 
     // Read samples in chunks and detect pitch
     let chunk_size = (sample_rate as usize) / 4; // 250ms chunks
@@ -101,11 +103,11 @@ fn analyze_file(path: &str) -> anyhow::Result<()> {
 }
 
 /// Play a reference tone for a given note.
-fn play_reference(note_name: &str, duration: f32) -> anyhow::Result<()> {
+fn play_reference(note_name: &str, duration: f32, a4: f32) -> anyhow::Result<()> {
     let note =
         Note::from_name(note_name).ok_or_else(|| anyhow::anyhow!("Unknown note: {}", note_name))?;
 
-    let temperament = Temperament::new();
+    let temperament = Temperament::with_a4(a4);
     let frequency = temperament.frequency(note.midi);
 
     println!(
@@ -120,6 +122,12 @@ fn play_reference(note_name: &str, duration: f32) -> anyhow::Result<()> {
 
     // Wait for playback to complete
     std::thread::sleep(Duration::from_secs_f32(duration + 0.1));
+
+    // Stream errors are parked (not printed) by the callback; report them
+    // here where stderr is safe
+    if let Some(err) = output.take_error() {
+        eprintln!("Warning: audio output error: {}", err);
+    }
 
     println!("Done.");
     Ok(())
@@ -199,17 +207,41 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
                     session.created_at.format("%Y-%m-%d %H:%M")
                 );
                 std::thread::sleep(Duration::from_millis(500));
-                App::with_session(session)
+                App::with_session(session, &config)
             }
             None => {
                 println!("No incomplete session found. Starting new session.");
                 std::thread::sleep(Duration::from_millis(500));
-                App::new()
+                App::with_config(&config)
             }
         }
     } else {
-        App::new()
+        App::with_config(&config)
     };
+
+    // Audio output for the lock beep (config/--beep). Opened before the TUI
+    // so a missing output device degrades to a status-line warning instead
+    // of failing mid-session.
+    let beep_output = if config.beep {
+        match AudioOutput::new() {
+            Ok(output) => Some(output),
+            Err(e) => {
+                app.set_audio_warning(format!("Beep disabled (no audio output): {}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // NOTE: restore the terminal before the default panic handler runs,
+    // otherwise the panic message prints into the vanishing alternate screen
+    // and the shell is left in raw mode.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = ui::restore();
+        original_hook(info);
+    }));
 
     // Initialize terminal
     let mut terminal = ui::init()?;
@@ -218,6 +250,18 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     let mut audio_buffer = vec![0.0f32; sample_rate as usize / 10]; // 100ms buffer
 
     let result = loop {
+        // Surface mic stream errors (e.g. device unplugged) in the UI
+        // status line instead of writing to stderr while the terminal is
+        // in raw mode
+        if let Some(err) = mic.take_error() {
+            app.set_audio_warning(format!("Audio input error: {}", err));
+        }
+        if let Some(output) = &beep_output {
+            if let Some(err) = output.take_error() {
+                app.set_audio_warning(format!("Audio output error: {}", err));
+            }
+        }
+
         // Read audio and detect pitch
         let read = mic.read_samples(&mut audio_buffer);
         if read > 0 {
@@ -228,16 +272,31 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
             }
         }
 
-        // Render UI
-        terminal.draw(|frame| {
+        // Lock beep: the app requests at most one per strike
+        if app.take_beep() {
+            if let Some(output) = &beep_output {
+                // Short 1 kHz blip - clearly a beep, not a piano partial
+                let _ = output.play_sine(1000.0, 0.08);
+            }
+        }
+
+        // Render UI (break instead of `?` so every exit path restores the
+        // terminal below)
+        if let Err(e) = terminal.draw(|frame| {
             app.render(frame);
-        })?;
+        }) {
+            break Err(e.into());
+        }
 
         // Handle input (non-blocking)
-        if let Some(event) = ui::poll_event(Duration::from_millis(50))? {
-            if let Some(key) = ui::is_key_press(&event) {
-                app.handle_key(key);
+        match ui::poll_event(Duration::from_millis(50)) {
+            Ok(Some(event)) => {
+                if let Some(key) = ui::is_key_press(&event) {
+                    app.handle_key(key);
+                }
             }
+            Ok(None) => {}
+            Err(e) => break Err(e.into()),
         }
 
         // Check for quit
@@ -248,6 +307,11 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
 
     // Restore terminal
     ui::restore()?;
+
+    // Report any save failure now that stderr is usable again
+    if let Some(err) = app.save_error() {
+        eprintln!("Warning: {}", err);
+    }
 
     result
 }

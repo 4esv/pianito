@@ -155,7 +155,10 @@ impl PianoProfile {
     /// Load a profile from a file path.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = fs::read_to_string(path)?;
-        let profile: PianoProfile = serde_json::from_str(&content)?;
+        let mut profile: PianoProfile = serde_json::from_str(&content)?;
+        // NOTE: hand-edited or truncated files may not have exactly 88 slots;
+        // normalize so indexed consumers can rely on NOTE_COUNT entries.
+        profile.notes.resize(NOTE_COUNT, None);
         Ok(profile)
     }
 
@@ -270,6 +273,23 @@ mod tests {
         assert_eq!(sorted[0].1.midi, 69); // -50 cents
         assert_eq!(sorted[1].1.midi, 108); // 10 cents
         assert_eq!(sorted[2].1.midi, 21); // 2 cents
+    }
+
+    #[test]
+    fn test_load_normalizes_note_count() {
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("truncated.json");
+
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 442.0, 7.85); // A4, index 48
+        profile.notes.truncate(50);
+        let json = serde_json::to_string(&profile).expect("Should serialize");
+        fs::write(&path, json).expect("Should write file");
+
+        let loaded = PianoProfile::load(&path).expect("Should load");
+        assert_eq!(loaded.notes.len(), NOTE_COUNT);
+        assert!(loaded.notes[48].is_some(), "Measured note survives");
+        assert!(loaded.notes[87].is_none(), "Missing slots pad with None");
     }
 
     #[test]

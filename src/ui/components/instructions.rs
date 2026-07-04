@@ -136,9 +136,10 @@ impl Instructions {
         }
     }
 
-    /// Set a direction hint based on cents deviation.
-    pub fn with_direction_hint(mut self, cents: f32) -> Self {
-        if cents.abs() > 5.0 {
+    /// Set a direction hint based on cents deviation. No hint is shown
+    /// while the pitch is within `tolerance` cents of the target.
+    pub fn with_direction_hint(mut self, cents: f32, tolerance: f32) -> Self {
+        if cents.abs() > tolerance {
             let hint = if cents < 0.0 {
                 "Turn tuning pin CLOCKWISE (tighten) slightly"
             } else {
@@ -243,4 +244,94 @@ fn textwrap(text: &str, max_width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk a chain from its first step. The chain length is the number of
+    /// SPACE presses needed to record a note in App::confirm_note.
+    fn walk(first: TuningStep) -> Vec<TuningStep> {
+        let mut steps = vec![first];
+        let mut current = first;
+        while let Some(next) = current.next() {
+            steps.push(next);
+            current = next;
+        }
+        steps
+    }
+
+    #[test]
+    fn test_first_step_per_string_count() {
+        assert_eq!(TuningStep::first_for_strings(1), None);
+        assert_eq!(
+            TuningStep::first_for_strings(2),
+            Some(TuningStep::MuteBichord)
+        );
+        assert_eq!(
+            TuningStep::first_for_strings(3),
+            Some(TuningStep::MuteOuter)
+        );
+    }
+
+    #[test]
+    fn test_bichord_chain_is_exactly_two_steps() {
+        let chain = walk(TuningStep::first_for_strings(2).unwrap());
+        assert_eq!(
+            chain,
+            vec![TuningStep::MuteBichord, TuningStep::TuneBichord]
+        );
+        assert_eq!(chain.last().unwrap().next(), None);
+    }
+
+    #[test]
+    fn test_trichord_chain_is_exactly_four_steps() {
+        let chain = walk(TuningStep::first_for_strings(3).unwrap());
+        assert_eq!(
+            chain,
+            vec![
+                TuningStep::MuteOuter,
+                TuningStep::TuneCenter,
+                TuningStep::TuneLeft,
+                TuningStep::TuneRight,
+            ]
+        );
+        assert_eq!(chain.last().unwrap().next(), None);
+    }
+
+    #[test]
+    fn test_prev_is_exact_inverse_of_next() {
+        // App::go_back rewinds with prev(); asymmetry would desync steps
+        for strings in [2u8, 3] {
+            let chain = walk(TuningStep::first_for_strings(strings).unwrap());
+            assert_eq!(chain[0].prev(), None, "first step has no prev");
+            for pair in chain.windows(2) {
+                assert_eq!(pair[0].next(), Some(pair[1]));
+                assert_eq!(pair[1].prev(), Some(pair[0]));
+            }
+        }
+    }
+
+    #[test]
+    fn test_step_numbers_match_chain_position() {
+        for strings in [2u8, 3] {
+            let chain = walk(TuningStep::first_for_strings(strings).unwrap());
+            for (i, step) in chain.iter().enumerate() {
+                assert_eq!(step.number() as usize, i + 1, "{:?}", step);
+                assert_eq!(step.total_steps() as usize, chain.len(), "{:?}", step);
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_muting_only_for_mute_steps() {
+        // Drives the meter-hidden rendering in the tuning screen
+        assert!(TuningStep::MuteBichord.is_muting());
+        assert!(TuningStep::MuteOuter.is_muting());
+        assert!(!TuningStep::TuneBichord.is_muting());
+        assert!(!TuningStep::TuneCenter.is_muting());
+        assert!(!TuningStep::TuneLeft.is_muting());
+        assert!(!TuningStep::TuneRight.is_muting());
+    }
 }

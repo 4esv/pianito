@@ -334,6 +334,30 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_at_production_window_size() {
+        // NOTE: the interactive tuner feeds the detector 100 ms windows
+        // (sample_rate / 10 in main.rs). At A0 = 27.5 Hz that is only ~2.75
+        // periods and tau_max sits close to the samples.len()/2 guard in
+        // detect() — the tightest operating point in the app. Guard it so
+        // window/tau changes can't silently break bass detection.
+        for &freq in &[27.5_f32, 55.0, 440.0] {
+            let source = TestAudioSource::sine(freq, 0.1, SAMPLE_RATE);
+            let result = PitchDetector::new(SAMPLE_RATE)
+                .detect(source.samples())
+                .unwrap_or_else(|| panic!("Should detect {}Hz in a 100ms window", freq));
+
+            let relative_error = (result.frequency - freq).abs() / freq;
+            assert!(
+                relative_error < 0.01,
+                "Expected {}Hz at 100ms window, got {} (relative error: {:.2}%)",
+                freq,
+                result.frequency,
+                relative_error * 100.0
+            );
+        }
+    }
+
+    #[test]
     fn test_various_frequencies() {
         // Test across the piano range
         let test_freqs = [55.0, 110.0, 220.0, 440.0, 880.0, 1760.0, 3520.0];
