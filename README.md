@@ -6,12 +6,13 @@ A terminal-based piano tuning application for macOS with guided coaching.
 
 - **Real-time pitch detection** using the YIN algorithm
 - **Visual cents deviation meter** with color-coded feedback
-- **Guided trichord tuning** with step-by-step coaching for 3-string notes
+- **Guided multi-string tuning** with step-by-step coaching for bichords and trichords
 - **Traditional tuning order** (temperament octave F3-F4 first, then up, then down)
 - **Session persistence** - resume interrupted tuning sessions
-- **Two tuning modes**:
-  - **Concert Pitch** - tune to A4 = 440 Hz (or custom reference)
+- **Three tuning modes**:
+  - **Concert Pitch** - tune to A4 = 440 Hz
   - **Quick Tune** - calibrate to the piano's current pitch center
+  - **Profile Piano** - measure all 88 keys first, then tune worst notes first
 
 ## Installation
 
@@ -32,29 +33,45 @@ The binary will be at `target/release/pianito`.
 ### Interactive Tuning
 
 ```bash
-# Start interactive tuning (concert pitch mode)
+# Start interactive tuning (opens the mode-select menu)
 pianito
 
 # Resume an interrupted session
 pianito --resume
 
-# Quick tune mode (calibrates to piano's current pitch)
-pianito --quick
+# Tune to A4 = 442 Hz with a lock beep
+pianito --a4 442 --beep
 
-# Custom A4 reference frequency
-pianito --a4 442
+# Open the menu with Quick Tune preselected
+pianito --quick
 ```
+
+Flags:
+
+- `--a4 <HZ>` sets the reference frequency for Concert Pitch and Profile
+  sessions (and the fallback when skipping Quick Tune calibration). Also
+  applies to the `reference` and `analyze` subcommands. On `--resume`, the
+  session's original A4 wins.
+- `--quick` preselects Quick Tune in the mode-select menu.
+- `--beep` plays a short beep the moment a string first enters the in-tune
+  zone (once per strike; silence re-arms it). Requires an audio output
+  device - without one, tuning continues and a warning shows in the status
+  line.
 
 ### Keyboard Controls
 
 | Key | Action |
 |-----|--------|
-| `↑/↓` | Navigate menu options |
+| `↑/↓` / `Tab` | Navigate menu options |
 | `Enter` | Select / Confirm |
-| `Space` | Confirm note is tuned |
-| `R` | Play reference tone |
-| `S` | Skip current note |
-| `Q` | Quit (saves session) |
+| `Space` | Confirm current step / note |
+| `B` | Back to previous step / note |
+| `P` | Toggle piano progress display |
+| `S` | Skip current note (on the Quick Tune calibration screen: skip calibration, use the configured A4 reference) |
+| `Q` / `Esc` | Quit (progress is saved after each confirmed note) |
+
+Reference tones are played with the `pianito reference` subcommand, not from
+the tuning screen.
 
 ### Commands
 
@@ -75,19 +92,23 @@ pianito reset
 
 ## Configuration
 
-Configuration is stored at `~/.config/pianito/config.toml`:
+Configuration is read from the pianito config directory
+(`~/Library/Application Support/pianito/config.toml` on macOS):
 
 ```toml
-# Default A4 reference frequency
+# Default A4 reference frequency (CLI --a4 overrides)
 a4 = 440.0
 
-# Tolerance in cents for "in tune" indicator
+# Tolerance in cents for the "in tune" zone on the meter,
+# direction hints, and the lock beep
 tolerance = 5.0
 
-# Enable beep on pitch lock
+# Beep once when a note locks into the in-tune zone
+# (CLI --beep also enables this)
 beep = false
 
-# Default mode: "concert" or "quick"
+# Mode preselected in the menu: "concert" or "quick"
+# (CLI --quick preselects quick)
 default_mode = "concert"
 ```
 
@@ -99,7 +120,22 @@ default_mode = "concert"
    - Temperament octave (F3-F4): 13 notes
    - Octaves upward (F#4-C8): 43 notes
    - Octaves downward (E3-A0): 32 notes
-4. **Trichord Coaching**: For 3-string notes, guides through muting, center string, then unisons
+4. **Multi-string Coaching**: Coaches each note based on its string count:
+   - A0-A#1 (1 string): tune directly
+   - B1-G#3 (bichord, 2 strings): 2 steps - mute the right string, tune the left, then unmute and match the right
+   - A3-C8 (trichord, 3 strings): 4 steps - mute the outer strings, tune the center, then left and right unisons
+
+### Profile Mode
+
+Profile mode measures the whole piano before tuning it. Play all 88 keys
+(A0→C8) one at a time; pianito records each note's deviation in cents. The
+profile is saved under the pianito data directory
+(`~/Library/Application Support/pianito/profiles` on macOS), then tuning
+starts with the order reshuffled: the temperament octave (F3-F4) stays first,
+and the remaining notes follow worst-deviation-first.
+
+On the profiling screen: `Space` confirms the current note, `B` goes back,
+`S` skips a note, `Q`/`Esc` quits.
 
 ## Requirements
 
