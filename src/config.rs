@@ -257,8 +257,10 @@ mod tests {
 
     #[test]
     fn test_merge_with_args_quick_mode_from_config() {
-        let mut config = Config::default();
-        config.default_mode = "quick".to_string();
+        let config = Config {
+            default_mode: "quick".to_string(),
+            ..Config::default()
+        };
         let args = Args {
             command: None,
             resume: false,
@@ -286,8 +288,10 @@ mod tests {
 
     #[test]
     fn test_merge_beep_from_config() {
-        let mut config = Config::default();
-        config.beep = true;
+        let config = Config {
+            beep: true,
+            ..Config::default()
+        };
         let args = Args {
             command: None,
             resume: false,
