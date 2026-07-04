@@ -200,7 +200,7 @@ impl Session {
         }
 
         // Sort by updated_at descending
-        sessions.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        sessions.sort_by_key(|(_, s)| std::cmp::Reverse(s.updated_at));
 
         Ok(sessions.into_iter().next().map(|(_, s)| s))
     }
@@ -230,7 +230,7 @@ impl Session {
         }
 
         // Sort by created_at descending
-        sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at));
 
         Ok(sessions)
     }
