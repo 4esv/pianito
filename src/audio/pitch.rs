@@ -12,6 +12,23 @@ pub struct PitchResult {
     pub confidence: f32,
 }
 
+/// Why `detect` could not return a pitch.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub enum DetectError {
+    /// The window is too short to resolve the configured `min_frequency`.
+    /// Carries the lowest frequency this window *can* resolve, so the caller
+    /// can widen the window or raise `min_frequency` rather than trusting a
+    /// silently raised floor.
+    #[error("window too short: lowest resolvable frequency is {min_resolvable_frequency:.1} Hz")]
+    WindowTooShort {
+        /// Lowest frequency resolvable at this window length, in Hz.
+        min_resolvable_frequency: f32,
+    },
+    /// No confident pitch found (silence, noise, or an aperiodic signal).
+    #[error("no confident pitch detected")]
+    NoPitch,
+}
+
 /// YIN-based pitch detector.
 pub struct PitchDetector {
     sample_rate: u32,
@@ -45,18 +62,28 @@ impl PitchDetector {
     }
 
     /// Detect pitch from audio samples using the YIN algorithm.
-    pub fn detect(&self, samples: &[f32]) -> Option<PitchResult> {
+    pub fn detect(&self, samples: &[f32]) -> Result<PitchResult, DetectError> {
         if samples.len() < 2 {
-            return None;
+            return Err(DetectError::NoPitch);
         }
 
         // Calculate tau range from frequency range
         let tau_min = (self.sample_rate as f32 / self.max_frequency) as usize;
-        let tau_max =
-            (self.sample_rate as f32 / self.min_frequency).min((samples.len() / 2) as f32) as usize;
+        let tau_max = (self.sample_rate as f32 / self.min_frequency) as usize;
 
-        if tau_max <= tau_min || tau_max >= samples.len() / 2 {
-            return None;
+        // WARNING: the difference function needs the window to span at least
+        // ~2 periods of min_frequency (tau_max < len/2). A shorter read can't
+        // reach the low end, so fail loudly with the frequency floor it
+        // imposes instead of silently clamping tau_max to len/2 and raising
+        // the minimum detectable frequency without telling anyone.
+        let half = samples.len() / 2;
+        if tau_max >= half {
+            return Err(DetectError::WindowTooShort {
+                min_resolvable_frequency: self.sample_rate as f32 / half as f32,
+            });
+        }
+        if tau_max <= tau_min {
+            return Err(DetectError::NoPitch);
         }
 
         // Step 1 & 2: Calculate the difference function
@@ -66,7 +93,9 @@ impl PitchDetector {
         let cmnd = self.cumulative_mean_normalized_difference(&diff);
 
         // Step 4: Absolute threshold
-        let tau = self.find_threshold_crossing(&cmnd, tau_min, tau_max)?;
+        let tau = self
+            .find_threshold_crossing(&cmnd, tau_min, tau_max)
+            .ok_or(DetectError::NoPitch)?;
 
         // Step 5: Parabolic interpolation for sub-sample accuracy
         let refined_tau = self.parabolic_interpolation(&cmnd, tau);
@@ -77,7 +106,7 @@ impl PitchDetector {
         // Calculate confidence (1 - cmnd value at the dip)
         let confidence = 1.0 - cmnd[tau].min(1.0);
 
-        Some(PitchResult {
+        Ok(PitchResult {
             frequency,
             confidence,
         })
@@ -205,7 +234,7 @@ mod tests {
     fn detect_frequency(frequency: f32) -> Option<PitchResult> {
         let source = TestAudioSource::sine(frequency, 0.2, SAMPLE_RATE);
         let detector = PitchDetector::new(SAMPLE_RATE);
-        detector.detect(source.samples())
+        detector.detect(source.samples()).ok()
     }
 
     #[test]
@@ -290,7 +319,7 @@ mod tests {
         let silence = vec![0.0; 4096];
         let detector = PitchDetector::new(SAMPLE_RATE);
         let result = detector.detect(&silence);
-        assert!(result.is_none(), "Silence should return None");
+        assert!(result.is_err(), "Silence should not detect a pitch");
     }
 
     #[test]
@@ -313,10 +342,10 @@ mod tests {
         let detector = PitchDetector::new(SAMPLE_RATE).with_threshold(0.1);
         let result = detector.detect(&noise);
 
-        // Noise should either return None or the detector should reject it
-        // due to the threshold (which results in None)
+        // Noise should be rejected by the threshold rather than yielding a
+        // confident pitch.
         assert!(
-            result.is_none(),
+            result.is_err(),
             "Noise should not produce a confident pitch detection"
         );
     }
@@ -329,8 +358,8 @@ mod tests {
         let strict_detector = PitchDetector::new(SAMPLE_RATE).with_threshold(0.01);
 
         // Both should detect the clear sine wave
-        assert!(loose_detector.detect(source.samples()).is_some());
-        assert!(strict_detector.detect(source.samples()).is_some());
+        assert!(loose_detector.detect(source.samples()).is_ok());
+        assert!(strict_detector.detect(source.samples()).is_ok());
     }
 
     #[test]
@@ -344,7 +373,7 @@ mod tests {
             let source = TestAudioSource::sine(freq, 0.1, SAMPLE_RATE);
             let result = PitchDetector::new(SAMPLE_RATE)
                 .detect(source.samples())
-                .unwrap_or_else(|| panic!("Should detect {}Hz in a 100ms window", freq));
+                .unwrap_or_else(|e| panic!("Should detect {}Hz in a 100ms window: {:?}", freq, e));
 
             let relative_error = (result.frequency - freq).abs() / freq;
             assert!(
@@ -355,6 +384,42 @@ mod tests {
                 relative_error * 100.0
             );
         }
+    }
+
+    #[test]
+    fn test_short_window_reports_too_short_not_silent_none() {
+        // A 50 ms read at 44.1 kHz spans 2205 samples: half the window is 1102
+        // samples, so the lowest resolvable period is ~40 Hz. The default
+        // detector's min_frequency is 27.5 Hz (A0), which this window cannot
+        // reach. The old code silently clamped tau_max to len/2 and returned a
+        // bare None even for a strong, easily-resolvable 440 Hz tone. Fail
+        // loudly instead, reporting the frequency floor this window imposes.
+        let source = TestAudioSource::sine(440.0, 0.05, SAMPLE_RATE);
+        let detector = PitchDetector::new(SAMPLE_RATE);
+
+        match detector.detect(source.samples()) {
+            Err(DetectError::WindowTooShort {
+                min_resolvable_frequency,
+            }) => {
+                assert!(
+                    (min_resolvable_frequency - 40.0).abs() < 1.0,
+                    "expected ~40 Hz floor, got {}",
+                    min_resolvable_frequency
+                );
+            }
+            other => panic!("expected WindowTooShort, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_no_pitch_is_typed_not_window_error() {
+        // Silence in an adequately long window is a NoPitch outcome, distinct
+        // from the WindowTooShort signal.
+        let detector = PitchDetector::new(SAMPLE_RATE);
+        assert_eq!(
+            detector.detect(&vec![0.0; 4096]).unwrap_err(),
+            DetectError::NoPitch
+        );
     }
 
     #[test]
