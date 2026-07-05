@@ -3,6 +3,8 @@
 //! Implementation based on:
 //! de Cheveigné, A., & Kawahara, H. (2002). "YIN, a fundamental frequency estimator for speech and music."
 
+use std::time::Duration;
+
 /// Pitch detection result.
 #[derive(Debug, Clone, Copy)]
 pub struct PitchResult {
@@ -67,6 +69,143 @@ impl PitchDetector {
         self.min_frequency = min;
         self.max_frequency = max;
         self
+    }
+
+    /// Longest analysis window (bass register). Sized in time so the sample
+    /// count tracks the device rate. Must fit inside the capture ring
+    /// buffer's retained span (`capture::RETAINED_WINDOW`, 500 ms): a window
+    /// longer than what capture keeps could never be filled.
+    pub const MAX_WINDOW: Duration = Duration::from_millis(400);
+
+    /// Samples spanning [`Self::MAX_WINDOW`] at `sample_rate`. `main` sizes the
+    /// capture buffer to this so every register's window fits in one read.
+    pub fn max_window_samples(sample_rate: u32) -> usize {
+        (sample_rate as f64 * Self::MAX_WINDOW.as_secs_f64()).round() as usize
+    }
+
+    /// Half-width of the guided search band, in semitones either side of the
+    /// target. The tuner is at most this far off when a string is struck; a
+    /// candidate outside the band is a wrong note, an octave partial, or room
+    /// tone — not the note being tuned.
+    const TARGET_BAND_SEMITONES: f32 = 2.0;
+
+    /// Confidence floor for accepting the deepest in-band dip. Because the
+    /// clamp removes octave/sub-harmonic ambiguity, the deepest dip inside the
+    /// band *is* the fundamental — this only rejects bands with no real
+    /// periodicity (wrong note struck, silence, noise), where even the best
+    /// dip stays shallow. Looser than the full-range threshold (0.1) on
+    /// purpose: the target prior justifies trusting a shallow bass dip the
+    /// general detector must reject.
+    const TARGET_MIN_CONFIDENCE: f32 = 0.5;
+
+    /// Register-adaptive analysis window for a target pitch: long for bass
+    /// (A0 spans ~11 periods at 400 ms vs ~2.75 at the old fixed 100 ms),
+    /// short for treble (sub-second sustain, strike transient decays fast).
+    /// Boundaries at C2 / C4 / C6 (equal temperament, A4 = 440); a couple Hz
+    /// of A4 calibration drift never crosses one.
+    fn window_for_target(target_hz: f32) -> Duration {
+        if target_hz < 65.406 {
+            Duration::from_millis(400) // below C2
+        } else if target_hz < 261.626 {
+            Duration::from_millis(200) // C2..C4
+        } else if target_hz < 1046.502 {
+            Duration::from_millis(100) // C4..C6
+        } else {
+            Duration::from_millis(60) // C6 and up
+        }
+    }
+
+    /// Detect pitch when the target note is known (guided mode).
+    ///
+    /// Two things the full-range [`detect`](Self::detect) can't do without the
+    /// prior:
+    /// - **Register window.** Analyze only the most recent
+    ///   [`window_for_target`] slice of `samples`, so bass gets many periods
+    ///   and treble stays inside the note's short sustain. `main` sizes the
+    ///   capture buffer to [`MAX_WINDOW`](Self::MAX_WINDOW) and hands the whole
+    ///   read here; this trims it per register.
+    /// - **Clamped search.** Restrict the tau search to +/-2 semitones of the
+    ///   target. That excludes octave partials and sub-harmonics by
+    ///   construction (no octave post-check needed), and lets the search
+    ///   accept the deepest in-band dip even when it never crosses the global
+    ///   threshold — the shallow-bass case `detect` reports as `NoPitch`.
+    pub fn detect_for_target(
+        &self,
+        samples: &[f32],
+        target_hz: f32,
+    ) -> Result<PitchResult, DetectError> {
+        if target_hz <= 0.0 {
+            return Err(DetectError::NoPitch);
+        }
+
+        // Window by register: keep only the most recent slice (freshest audio
+        // sits at the back of the capture read).
+        let want = (self.sample_rate as f64 * Self::window_for_target(target_hz).as_secs_f64())
+            .round() as usize;
+        let samples = if want >= 2 && samples.len() > want {
+            &samples[samples.len() - want..]
+        } else {
+            samples
+        };
+
+        if samples.len() < 2 {
+            return Err(DetectError::NoPitch);
+        }
+
+        // Clamp the tau range to +/-2 semitones of the target.
+        let edge = 2.0f32.powf(Self::TARGET_BAND_SEMITONES / 12.0);
+        let f_high = target_hz * edge;
+        let f_low = target_hz / edge;
+        let tau_min = ((self.sample_rate as f32 / f_high) as usize).max(1);
+        let tau_max = (self.sample_rate as f32 / f_low) as usize;
+
+        // Same short-window guard as `detect`: the difference function needs
+        // the window to span ~2 periods of the band's low edge (tau_max <
+        // len/2). window_for_target keeps bass at 400 ms so this holds, but a
+        // partially-filled early read can still be too short — fail loudly.
+        let half = samples.len() / 2;
+        if tau_max >= half {
+            return Err(DetectError::WindowTooShort {
+                min_resolvable_frequency: self.sample_rate as f32 / half as f32,
+            });
+        }
+        if tau_max <= tau_min {
+            return Err(DetectError::NoPitch);
+        }
+
+        // PERF: the O(N*tau_max) difference function is the hot path. Worst
+        // case is the 400 ms bass window (N~17.6k, tau_max~1.8k): ~18 ms/frame
+        // in release, well inside the ~50 ms interactive poll budget and hit
+        // only on bass strikes. For the rest of the keyboard the clamp shrinks
+        // tau_max sharply (band low edge, not 27.5 Hz), so mid/treble frames
+        // are far cheaper than the full-range detector. An FFT autocorrelation
+        // would help only if bass frame time later becomes a problem.
+        let diff = self.difference_function(samples, tau_max);
+        let cmnd = self.cumulative_mean_normalized_difference(&diff);
+
+        // Deepest dip inside the band. No octave post-check: the clamp already
+        // excludes 2*tau, so a partial can't masquerade as the fundamental.
+        let mut best = tau_min;
+        #[allow(clippy::needless_range_loop)]
+        for tau in (tau_min + 1)..=tau_max {
+            if cmnd[tau] < cmnd[best] {
+                best = tau;
+            }
+        }
+
+        let confidence = 1.0 - cmnd[best].min(1.0);
+        if confidence < Self::TARGET_MIN_CONFIDENCE {
+            // Nothing in the guided band is periodic enough to be the note.
+            return Err(DetectError::NoPitch);
+        }
+
+        let refined_tau = self.parabolic_interpolation(&cmnd, best);
+        let frequency = self.sample_rate as f32 / refined_tau;
+
+        Ok(PitchResult {
+            frequency,
+            confidence,
+        })
     }
 
     /// Detect pitch from audio samples using the YIN algorithm.
@@ -327,6 +466,117 @@ mod tests {
             }
         }
         s
+    }
+
+    /// Ratio bounds for "within `n` semitones" comparisons.
+    fn within_semitones(freq: f32, target: f32, n: f32) -> bool {
+        let ratio = freq / target;
+        let edge = 2.0f32.powf(n / 12.0);
+        ratio >= 1.0 / edge && ratio <= edge
+    }
+
+    #[test]
+    fn test_window_scales_with_register() {
+        // Long windows for bass (many periods), short for treble (sub-second
+        // sustain). Boundaries at C2/C4/C6.
+        use std::time::Duration;
+        assert_eq!(
+            PitchDetector::window_for_target(27.5), // A0, below C2
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            PitchDetector::window_for_target(110.0), // A2, C2..C4
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            PitchDetector::window_for_target(440.0), // A4, C4..C6
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            PitchDetector::window_for_target(2093.0), // C7, above C6
+            Duration::from_millis(60)
+        );
+    }
+
+    #[test]
+    fn test_target_prior_resolves_bass_that_plain_detect_rejects() {
+        // A heavily inharmonic bass strike (weak fundamental, stretched
+        // partials): no lag drives cmnd below the global detection threshold,
+        // so the full-range detector reports nothing — exactly the regime it
+        // deliberately rejects without a target-note prior (see
+        // `find_threshold_crossing`). Guided mode knows the note, so the
+        // +/-2-semitone clamp lets it accept the deepest in-band dip and hand
+        // the user a reading to tune against.
+        let signal = inharmonic_stack(
+            55.0, // A1
+            &[(1.0, 0.1), (2.0, 1.0), (3.0, 0.8), (4.0, 0.6), (5.0, 0.4)],
+            0.008,
+            0.4, // 400 ms bass window
+        );
+
+        // Current fixed-window detector gives up.
+        let plain = PitchDetector::new(SAMPLE_RATE).detect(&signal);
+        assert!(
+            plain.is_err(),
+            "precondition: the full-range detector must reject this signal, got {:?}",
+            plain.map(|r| r.frequency)
+        );
+
+        // Guided detector resolves it, inside the +/-2-semitone band and
+        // within a semitone of the target.
+        let guided = PitchDetector::new(SAMPLE_RATE)
+            .detect_for_target(&signal, 55.0)
+            .expect("guided detector should resolve the bass note");
+        assert!(
+            within_semitones(guided.frequency, 55.0, 1.0),
+            "expected a reading within a semitone of 55 Hz, got {}",
+            guided.frequency
+        );
+        assert!(
+            guided.confidence > 0.6,
+            "in-band dip should be confident, got {}",
+            guided.confidence
+        );
+    }
+
+    #[test]
+    fn test_target_clamp_rejects_out_of_band_candidate() {
+        // A clean 440 Hz tone struck while the app is guiding E4 (330 Hz): 440
+        // is a fourth away, well outside +/-2 semitones of the target. The
+        // full-range detector locks onto it confidently; the clamped search
+        // must reject it rather than report a note the user isn't tuning.
+        let source = TestAudioSource::sine(440.0, 0.2, SAMPLE_RATE);
+
+        let plain = PitchDetector::new(SAMPLE_RATE)
+            .detect(source.samples())
+            .expect("full-range detector locks onto the 440 Hz tone");
+        assert!(
+            (plain.frequency - 440.0).abs() < 2.0,
+            "precondition: plain detect finds 440, got {}",
+            plain.frequency
+        );
+
+        let guided = PitchDetector::new(SAMPLE_RATE).detect_for_target(source.samples(), 330.0);
+        assert!(
+            guided.is_err(),
+            "440 Hz is outside +/-2 semitones of the 330 Hz target and must be rejected, got {:?}",
+            guided.map(|r| r.frequency)
+        );
+    }
+
+    #[test]
+    fn test_detect_for_target_agrees_with_plain_on_clean_note() {
+        // Regression: an in-tune note under guidance must resolve to the same
+        // pitch the full-range detector finds.
+        let source = TestAudioSource::sine(440.0, 0.2, SAMPLE_RATE);
+        let guided = PitchDetector::new(SAMPLE_RATE)
+            .detect_for_target(source.samples(), 440.0)
+            .expect("clean A4 should resolve under guidance");
+        assert!(
+            (guided.frequency - 440.0).abs() < 1.0,
+            "expected ~440 Hz, got {}",
+            guided.frequency
+        );
     }
 
     #[test]

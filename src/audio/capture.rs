@@ -451,6 +451,19 @@ mod tests {
     }
 
     #[test]
+    fn test_max_analysis_window_fits_retained_capture() {
+        // The bass analysis window (pitch::PitchDetector::MAX_WINDOW) must
+        // never exceed what capture retains, or detect_for_target could ask
+        // for more audio than the ring buffer holds.
+        assert!(
+            crate::audio::pitch::PitchDetector::MAX_WINDOW <= RETAINED_WINDOW,
+            "MAX_WINDOW {:?} exceeds retained capture {:?}",
+            crate::audio::pitch::PitchDetector::MAX_WINDOW,
+            RETAINED_WINDOW
+        );
+    }
+
+    #[test]
     fn test_window_samples_scales_with_sample_rate() {
         // The old fixed 22050-sample cap held only 0.459 s at 48 kHz; sizing
         // from a Duration must hold a full 0.5 s at either rate.
