@@ -10,7 +10,11 @@ readme = "README.md"
 keywords = ["piano", "tuner", "tuning", "tui", "audio"]
 categories = ["command-line-utilities", "multimedia::audio"]
 rust-version = "1.82"
-include = ["src/**", "Cargo.toml", "LICENSE", "README.md"]
+# NOTE: patterns are anchored to the package root. `/README.md` (not bare
+# `README.md`, which matches at any depth under gitignore glob rules) keeps the
+# test corpus's own docs — e.g. tests/fixtures/piano_samples/README.md — out of
+# the published crate. The fixtures stay out of the 10 MB package entirely.
+include = ["src/**", "/Cargo.toml", "/LICENSE", "/README.md"]
 
 [dependencies]
 # Audio I/O
@@ -40,3 +44,7 @@ chrono = { version = "0.4", features = ["serde"] }
 [dev-dependencies]
 tempfile = "3"
 approx = "0.5"
+# WARNING: hound is a normal dependency, but Rust integration-test crates
+# (tests/) only link the crate under test plus dev-dependencies, so the
+# detection harness needs its own entry to encode fixture WAVs.
+hound = "3.5"
