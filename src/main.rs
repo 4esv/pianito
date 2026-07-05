@@ -267,8 +267,9 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     // Initialize terminal
     let mut terminal = ui::init()?;
 
-    // Main loop
-    let mut audio_buffer = vec![0.0f32; sample_rate as usize / 10]; // 100ms buffer
+    // Main loop. Size the buffer to the largest (bass) analysis window; the
+    // guided detector trims it to the current note's register per frame.
+    let mut audio_buffer = vec![0.0f32; PitchDetector::max_window_samples(sample_rate)];
 
     // Reject isolated octave-off / glitch frames before they reach the meter.
     let mut pitch_filter = MedianFilter::new(MedianFilter::DEFAULT_WINDOW);
@@ -286,10 +287,18 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
             }
         }
 
-        // Read audio and detect pitch
+        // Read audio and detect pitch. When the app is guiding a specific
+        // note, use the target-aware detector: it picks the register window
+        // and clamps the search to +/-2 semitones. Otherwise (mode select,
+        // calibration, profiling) fall back to the full-range detector.
         let read = mic.read_samples(&mut audio_buffer);
         if read > 0 {
-            match detector.detect(&audio_buffer[..read]) {
+            let slice = &audio_buffer[..read];
+            let detection = match app.current_target_freq() {
+                Some(target) => detector.detect_for_target(slice, target),
+                None => detector.detect(slice),
+            };
+            match detection {
                 Ok(pitch_result) => {
                     let smoothed = pitch_filter.push(pitch_result.frequency);
                     app.update_pitch(smoothed, pitch_result.confidence);
