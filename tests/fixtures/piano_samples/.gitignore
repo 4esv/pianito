@@ -1,0 +1,7 @@
+# Real recordings are large binaries: keep them out of the repo and the
+# crates.io package. The synthetic corpus is the committed gate; drop local
+# WAVs here to run the opt-in real-sample cross-check (see README.md).
+*.wav
+*.aiff
+*.aif
+*.flac
