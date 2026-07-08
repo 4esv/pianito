@@ -8,7 +8,7 @@ use crate::tuning::flow::TuningFlow;
 use crate::tuning::order::TuningOrder;
 use crate::tuning::profile::PianoProfile;
 use crate::tuning::session::{Session, TuningMode};
-use crate::tuning::stretch::StretchCurve;
+use crate::tuning::stretch::{StretchCurve, StretchMode};
 use crate::tuning::temperament::Temperament;
 
 use super::screens::{
@@ -70,9 +70,13 @@ pub struct App {
     /// A beep is due; the main loop drains this via `take_beep` (the App
     /// has no audio output of its own).
     beep_pending: bool,
-    /// Railsback stretch curve applied to targets (None = pure equal
-    /// temperament). Same role as `temperament`: pre-session copy, handed
-    /// to the flow when the session starts.
+    /// Configured stretch mode (from CLI/config file); resolved to `stretch`
+    /// via [`StretchMode::resolve`] whenever the mode or the loaded profile
+    /// changes.
+    stretch_mode: StretchMode,
+    /// Stretch curve applied to targets, resolved from `stretch_mode` (None
+    /// = pure equal temperament). Same role as `temperament`: pre-session
+    /// copy, handed to the flow when the session starts.
     stretch: Option<StretchCurve>,
     /// Most recent save failure (session autosave or profile save),
     /// surfaced in the status line.
@@ -102,6 +106,7 @@ impl App {
             default_mode: SelectedMode::default(),
             beep_enabled: false,
             beep_pending: false,
+            stretch_mode: StretchMode::default(),
             stretch: Some(StretchCurve::railsback_default()),
             save_error: None,
             resume_warning: None,
@@ -110,8 +115,8 @@ impl App {
     }
 
     /// Create a new application honoring the effective CLI/config settings:
-    /// A4 reference, in-tune tolerance, lock beep, and the default mode
-    /// preselected in the menu.
+    /// A4 reference, in-tune tolerance, lock beep, stretch mode, and the
+    /// default mode preselected in the menu.
     pub fn with_config(config: &EffectiveConfig) -> Self {
         let mut app = Self::new();
         app.configured_a4 = config.a4;
@@ -123,6 +128,7 @@ impl App {
             SelectedMode::ConcertPitch
         };
         app.mode_select.select(app.default_mode);
+        app.set_stretch_mode(config.stretch);
         app
     }
 
@@ -152,6 +158,7 @@ impl App {
                         Some("Saved profile not found - resuming in traditional order".to_string());
                 }
             }
+            app.recompute_stretch();
         }
 
         app.flow = Some(TuningFlow::resume(
@@ -192,9 +199,20 @@ impl App {
         }
     }
 
-    /// Enable or disable stretch tuning (Railsback curve).
-    pub fn set_stretch(&mut self, enabled: bool) {
-        self.stretch = enabled.then(StretchCurve::railsback_default);
+    /// Set the stretch mode and re-resolve the active curve from it (and
+    /// the currently loaded profile, if any - see [`StretchMode::resolve`]).
+    pub fn set_stretch_mode(&mut self, mode: StretchMode) {
+        self.stretch_mode = mode;
+        self.recompute_stretch();
+    }
+
+    /// Re-resolve `stretch` from `stretch_mode` and `profile`. Called
+    /// whenever either changes: directly from `set_stretch_mode`, and after
+    /// `profile` goes from `None` to `Some` (`finish_profiling`, and
+    /// `with_session` resuming a profile-linked session) - moments
+    /// `with_config`'s initial resolve couldn't have accounted for.
+    fn recompute_stretch(&mut self) {
+        self.stretch = self.stretch_mode.resolve(self.profile.as_ref());
     }
 
     /// Error from the most recent save (session or profile), if any. Also
@@ -445,6 +463,7 @@ impl App {
             // Tuning order based on profile deviations.
             let tuning_order = TuningOrder::from_profile(&profile);
             self.profile = Some(profile);
+            self.recompute_stretch();
 
             self.start_tuning(TuningMode::Profile, tuning_order);
         }
@@ -778,6 +797,7 @@ mod tests {
             beep: false,
             quick_mode: false,
             resume: false,
+            stretch: StretchMode::Railsback,
         }
     }
 
@@ -928,9 +948,63 @@ mod tests {
     #[test]
     fn test_stretch_can_be_disabled() {
         let mut app = App::new();
-        app.set_stretch(false);
+        app.set_stretch_mode(StretchMode::Off);
         assert_eq!(app.target_for_midi(21), app.temperament.frequency(21));
         assert_eq!(app.target_for_midi(108), app.temperament.frequency(108));
+    }
+
+    #[test]
+    fn test_with_config_off_yields_no_stretch() {
+        let config = EffectiveConfig {
+            stretch: StretchMode::Off,
+            ..test_config(440.0)
+        };
+        let app = App::with_config(&config);
+        assert!(app.stretch.is_none());
+    }
+
+    #[test]
+    fn test_with_config_railsback_yields_railsback_curve() {
+        let config = EffectiveConfig {
+            stretch: StretchMode::Railsback,
+            ..test_config(440.0)
+        };
+        let app = App::with_config(&config);
+        assert_eq!(
+            app.stretch.as_ref().unwrap().offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_with_config_profile_without_loaded_profile_falls_back_to_railsback() {
+        let config = EffectiveConfig {
+            stretch: StretchMode::Profile,
+            ..test_config(440.0)
+        };
+        let app = App::with_config(&config);
+        assert_eq!(
+            app.stretch.as_ref().unwrap().offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_profile_mode_uses_measured_curve_once_profile_is_loaded() {
+        let config = EffectiveConfig {
+            stretch: StretchMode::Profile,
+            ..test_config(440.0)
+        };
+        let mut app = App::with_config(&config);
+
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -12.5); // A0, measured 12.5 cents flat
+        app.profile = Some(profile);
+        app.recompute_stretch();
+
+        assert_eq!(app.stretch.as_ref().unwrap().offset_cents(21), -12.5);
+        // A key the profile never measured stays at 0, not the Railsback value.
+        assert_eq!(app.stretch.as_ref().unwrap().offset_cents(108), 0.0);
     }
 
     #[test]

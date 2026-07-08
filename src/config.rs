@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::tuning::stretch::StretchMode;
+
 /// CLI Piano Tuner with guided coaching.
 #[derive(Parser, Debug)]
 #[command(name = "pianito")]
@@ -29,6 +31,10 @@ pub struct Args {
     /// Beep once when a note locks into the in-tune zone.
     #[arg(long)]
     pub beep: bool,
+
+    /// How piano stretch is applied to tuning targets.
+    #[arg(long, value_enum)]
+    pub stretch: Option<StretchMode>,
 }
 
 /// Subcommands.
@@ -83,6 +89,10 @@ pub struct Config {
     /// Default tuning mode ("concert" or "quick").
     #[serde(default = "default_mode")]
     pub default_mode: String,
+    /// How stretch is applied to tuning targets ("off", "railsback", or
+    /// "profile"); see [`StretchMode`].
+    #[serde(default)]
+    pub stretch: StretchMode,
 }
 
 fn default_a4() -> f32 {
@@ -104,6 +114,7 @@ impl Default for Config {
             tolerance: default_tolerance(),
             beep: false,
             default_mode: default_mode(),
+            stretch: StretchMode::default(),
         }
     }
 }
@@ -163,6 +174,7 @@ impl Config {
             beep: args.beep || self.beep,
             quick_mode: args.quick || self.default_mode == "quick",
             resume: args.resume,
+            stretch: args.stretch.unwrap_or(self.stretch),
         }
     }
 }
@@ -180,6 +192,8 @@ pub struct EffectiveConfig {
     pub quick_mode: bool,
     /// Resume previous session.
     pub resume: bool,
+    /// How stretch is applied to tuning targets.
+    pub stretch: StretchMode,
 }
 
 #[cfg(test)]
@@ -194,6 +208,7 @@ mod tests {
         assert_eq!(config.tolerance, 5.0);
         assert!(!config.beep);
         assert_eq!(config.default_mode, "concert");
+        assert_eq!(config.stretch, StretchMode::Railsback);
     }
 
     #[test]
@@ -212,6 +227,7 @@ mod tests {
             quick: false,
             a4: None,
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
 
@@ -231,6 +247,7 @@ mod tests {
             quick: false,
             a4: Some(442.0),
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert_eq!(effective.a4, 442.0);
@@ -245,6 +262,7 @@ mod tests {
             quick: false,
             a4: None,
             beep: true,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.beep);
@@ -259,6 +277,7 @@ mod tests {
             quick: true,
             a4: None,
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.quick_mode);
@@ -276,6 +295,7 @@ mod tests {
             quick: false,
             a4: None,
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.quick_mode);
@@ -290,6 +310,7 @@ mod tests {
             quick: false,
             a4: None,
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.resume);
@@ -307,6 +328,7 @@ mod tests {
             quick: false,
             a4: None,
             beep: false,
+            stretch: None,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.beep); // Config beep is true
@@ -319,6 +341,7 @@ mod tests {
             tolerance: 10.0,
             beep: true,
             default_mode: "quick".to_string(),
+            stretch: StretchMode::Off,
         };
 
         let toml = toml::to_string(&config).expect("Should serialize");
@@ -326,6 +349,7 @@ mod tests {
         assert!(toml.contains("tolerance = 10"));
         assert!(toml.contains("beep = true"));
         assert!(toml.contains("default_mode = \"quick\""));
+        assert!(toml.contains("stretch = \"off\""));
     }
 
     #[test]
@@ -381,6 +405,7 @@ mod tests {
             tolerance: 10.0,
             beep: true,
             default_mode: "quick".to_string(),
+            stretch: StretchMode::Profile,
         };
 
         // Save to temp file
@@ -395,6 +420,7 @@ mod tests {
         assert_eq!(loaded.tolerance, 10.0);
         assert!(loaded.beep);
         assert_eq!(loaded.default_mode, "quick");
+        assert_eq!(loaded.stretch, StretchMode::Profile);
     }
 
     #[test]
@@ -411,6 +437,7 @@ mod tests {
             quick,
             a4,
             beep,
+            stretch: None,
         }
     }
 
@@ -467,5 +494,70 @@ mod tests {
         assert!(parse_duration("NaN").is_err());
         assert!(parse_duration("inf").is_err());
         assert!(parse_duration("abc").is_err());
+    }
+
+    #[test]
+    fn cli_parses_each_stretch_mode() {
+        let off = Args::try_parse_from(["pianito", "--stretch", "off"]).expect("valid");
+        assert_eq!(off.stretch, Some(StretchMode::Off));
+
+        let railsback = Args::try_parse_from(["pianito", "--stretch", "railsback"]).expect("valid");
+        assert_eq!(railsback.stretch, Some(StretchMode::Railsback));
+
+        let profile = Args::try_parse_from(["pianito", "--stretch", "profile"]).expect("valid");
+        assert_eq!(profile.stretch, Some(StretchMode::Profile));
+    }
+
+    #[test]
+    fn cli_rejects_unknown_stretch_mode() {
+        assert!(Args::try_parse_from(["pianito", "--stretch", "bogus"]).is_err());
+    }
+
+    #[test]
+    fn cli_omitted_stretch_flag_is_none() {
+        let args = Args::try_parse_from(["pianito"]).expect("valid");
+        assert!(args.stretch.is_none());
+    }
+
+    #[test]
+    fn toml_parses_each_stretch_mode() {
+        for (text, expected) in [
+            ("stretch = \"off\"", StretchMode::Off),
+            ("stretch = \"railsback\"", StretchMode::Railsback),
+            ("stretch = \"profile\"", StretchMode::Profile),
+        ] {
+            let config: Config = toml::from_str(text).expect("valid stretch key");
+            assert_eq!(config.stretch, expected);
+        }
+    }
+
+    #[test]
+    fn missing_stretch_key_defaults_to_railsback() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.stretch, StretchMode::Railsback);
+    }
+
+    #[test]
+    fn cli_stretch_flag_overrides_config_stretch() {
+        let config = Config {
+            stretch: StretchMode::Railsback,
+            ..Config::default()
+        };
+        let args = Args {
+            stretch: Some(StretchMode::Off),
+            ..args(None, false, false)
+        };
+        let effective = config.merge_with_args(&args);
+        assert_eq!(effective.stretch, StretchMode::Off);
+    }
+
+    #[test]
+    fn config_stretch_used_without_cli_override() {
+        let config = Config {
+            stretch: StretchMode::Profile,
+            ..Config::default()
+        };
+        let effective = config.merge_with_args(&args(None, false, false));
+        assert_eq!(effective.stretch, StretchMode::Profile);
     }
 }
