@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::audio::Partial;
+
 use super::notes::{Note, NOTES, NOTE_COUNT};
 
 /// A single profiled note measurement.
@@ -19,16 +21,28 @@ pub struct ProfiledNote {
     pub cents: f32,
     /// When this measurement was taken.
     pub timestamp: DateTime<Utc>,
+    /// Measured partials (n=1..~8) from the FFT analyzer (issue #22), the
+    /// raw data issue #23's inharmonicity fit builds `B` from. Empty for
+    /// profiles saved before this field existed, or when confirm captured
+    /// no partials (silence/noise).
+    #[serde(default)]
+    pub partials: Vec<Partial>,
 }
 
 impl ProfiledNote {
-    /// Create a new profiled note.
+    /// Create a new profiled note with no partial data.
     pub fn new(midi: u8, frequency: f32, cents: f32) -> Self {
+        Self::with_partials(midi, frequency, cents, Vec::new())
+    }
+
+    /// Create a new profiled note, including its measured partial spectrum.
+    pub fn with_partials(midi: u8, frequency: f32, cents: f32, partials: Vec<Partial>) -> Self {
         Self {
             midi,
             frequency,
             cents,
             timestamp: Utc::now(),
+            partials,
         }
     }
 }
@@ -72,9 +86,24 @@ impl PianoProfile {
 
     /// Record a note measurement.
     pub fn record_note(&mut self, midi: u8, frequency: f32, cents: f32) {
+        self.record_note_with_partials(midi, frequency, cents, Vec::new());
+    }
+
+    /// Record a note measurement along with its measured partial spectrum
+    /// (issue #22), captured by the FFT analyzer against the same audio
+    /// window the frequency/cents reading came from.
+    pub fn record_note_with_partials(
+        &mut self,
+        midi: u8,
+        frequency: f32,
+        cents: f32,
+        partials: Vec<Partial>,
+    ) {
         if let Some(idx) = Self::midi_to_index(midi) {
             if idx < self.notes.len() {
-                self.notes[idx] = Some(ProfiledNote::new(midi, frequency, cents));
+                self.notes[idx] = Some(ProfiledNote::with_partials(
+                    midi, frequency, cents, partials,
+                ));
             }
         }
     }
@@ -383,5 +412,85 @@ mod tests {
         assert_eq!(PianoProfile::midi_to_index(108), Some(87)); // C8
         assert_eq!(PianoProfile::midi_to_index(20), None); // Out of range
         assert_eq!(PianoProfile::midi_to_index(109), None); // Out of range
+    }
+
+    fn sample_partials() -> Vec<Partial> {
+        vec![
+            Partial {
+                n: 1,
+                freq_hz: 55.02,
+                amplitude: 0.9,
+            },
+            Partial {
+                n: 2,
+                freq_hz: 110.08,
+                amplitude: 0.6,
+            },
+            Partial {
+                n: 3,
+                freq_hz: 165.31,
+                amplitude: 0.3,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_record_note_has_no_partials() {
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 442.0, 7.85);
+
+        let note = profile.notes[48].as_ref().expect("A4 recorded");
+        assert!(note.partials.is_empty());
+    }
+
+    #[test]
+    fn test_record_note_with_partials_stores_them() {
+        let mut profile = PianoProfile::new();
+        profile.record_note_with_partials(33, 55.0, 0.5, sample_partials());
+
+        let note = profile.notes[12].as_ref().expect("A1 recorded"); // midi 33 -> index 12
+        assert_eq!(note.partials.len(), 3);
+        assert_eq!(note.partials[1].n, 2);
+        assert!((note.partials[1].freq_hz - 110.08).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_partials_round_trip_through_serde() {
+        let mut profile = PianoProfile::new();
+        profile.record_note_with_partials(33, 55.0, 0.5, sample_partials());
+
+        let json = serde_json::to_string(&profile).expect("Should serialize");
+        let restored: PianoProfile = serde_json::from_str(&json).expect("Should deserialize");
+
+        let note = restored.notes[12].as_ref().expect("A1 recorded");
+        assert_eq!(note.partials, sample_partials());
+    }
+
+    #[test]
+    fn test_load_legacy_profile_without_partials_defaults_to_empty() {
+        // Simulates a profile saved before `partials` existed on
+        // `ProfiledNote` (issue #22): strip the field from an otherwise-real
+        // serialized profile and confirm it still loads, defaulting to empty
+        // rather than failing.
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("legacy.json");
+
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 442.0, 7.85); // A4, index 48
+
+        let mut value = serde_json::to_value(&profile).expect("Should serialize");
+        value["notes"][48]
+            .as_object_mut()
+            .expect("A4 note object")
+            .remove("partials");
+        fs::write(&path, value.to_string()).expect("Should write fixture");
+
+        let loaded = PianoProfile::load(&path).expect("legacy profile without partials must load");
+        let note = loaded.notes[48].as_ref().expect("A4 recorded");
+        assert_eq!(note.midi, 69);
+        assert!(
+            note.partials.is_empty(),
+            "missing field must default to empty, not fail"
+        );
     }
 }
