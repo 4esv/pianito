@@ -4,11 +4,21 @@
 //! than perfect integer multiples of the fundamental. Professional piano tuning
 //! compensates with "stretch tuning" where bass notes are tuned slightly flat
 //! and treble notes slightly sharp.
+//!
+//! `StretchCurve` is plain data (a per-key cents table) plus builders that
+//! populate it. `railsback_default()` builds the population-average curve
+//! below; `from_offsets()` is the general constructor for any other source -
+//! a fixed table, or (issue #23) 88 offsets computed from a piano's measured
+//! inharmonicity. Consumers (`App::target_for_midi`) only ever call
+//! `offset_cents()` / `apply()`, so adding builders is the entire surface
+//! those issues need.
 
-/// Stretch tuning curve based on the Railsback curve.
+/// Stretch tuning curve: per-key cents offsets from equal temperament.
 ///
-/// The Railsback curve is an empirical curve showing how piano tuners
-/// deviate from equal temperament to achieve the most pleasing sound.
+/// Backed by a plain `[f32; 88]` table so it can come from any source - the
+/// built-in Railsback-inspired default, a fixed table, or (issue #23) offsets
+/// fit from a piano's measured inharmonicity - through the same runtime
+/// representation and the same `offset_cents()` / `apply()` call sites.
 #[derive(Debug, Clone)]
 pub struct StretchCurve {
     /// Stretch values in cents for each of the 88 keys.
@@ -17,11 +27,18 @@ pub struct StretchCurve {
 }
 
 impl StretchCurve {
-    /// Create a new stretch curve with default Railsback-inspired values.
-    pub fn new() -> Self {
-        Self {
-            offsets: Self::generate_railsback_curve(),
-        }
+    /// Build a curve directly from a precomputed per-key cents table.
+    /// Index 0 = A0 (MIDI 21), index 87 = C8 (MIDI 108).
+    pub fn from_offsets(offsets: [f32; 88]) -> Self {
+        Self { offsets }
+    }
+
+    /// The built-in Railsback-inspired default: a simplified model based on
+    /// typical Railsback curves, identical for every piano (no measurement
+    /// involved). Bass notes go progressively flat, the middle stays near
+    /// the "temperament zone", and treble notes go progressively sharp.
+    pub fn railsback_default() -> Self {
+        Self::from_offsets(Self::generate_railsback_curve())
     }
 
     /// Get the stretch offset in cents for a given MIDI note.
@@ -38,12 +55,7 @@ impl StretchCurve {
         self.offsets.get(index).copied().unwrap_or(0.0)
     }
 
-    /// Generate a simplified Railsback-style stretch curve.
-    ///
-    /// This is a simplified model based on typical Railsback curves:
-    /// - Bass notes (A0-C3): progressively flat, about -16 cents at A0
-    /// - Middle octaves (C3-F5): close to 0, the "temperament zone"
-    /// - Treble notes (F5-C8): progressively sharp, about +24 cents at C8
+    /// Generate the Railsback-inspired default table.
     fn generate_railsback_curve() -> [f32; 88] {
         let mut offsets = [0.0_f32; 88];
 
@@ -61,10 +73,22 @@ impl StretchCurve {
     /// - A0 (21): approximately -15.7 cents
     /// - C4 (60): approximately 0 cents
     /// - C8 (108): approximately +23.8 cents
+    ///
+    /// NOTE: `center`/`range` are NOT symmetric around the 88-key span
+    /// (MIDI 21-108, midpoint 64.5, half-span 43.5). `center = 60` (middle
+    /// C) puts the curve's zero-crossing 4.5 semitones below the keyboard's
+    /// true midpoint, and `range = 44` is a half-span measured from that
+    /// off-center point rather than from the midpoint - despite the doc
+    /// above once calling it "half the piano range". The net effect: A0
+    /// reaches only x ~= -0.885 while C8 reaches x ~= 1.091, so the treble
+    /// end is stretched more aggressively per semitone than the bass end.
+    /// This is unchanged by the #18 refactor (data/builders only, no curve-
+    /// shape change - see the characterization test below); a truly
+    /// symmetric or measurement-driven curve is #23's job.
     fn calculate_stretch(midi: u8) -> f32 {
         // Center of the piano (around middle C)
         let center: f32 = 60.0;
-        let range: f32 = 44.0; // Half the piano range
+        let range: f32 = 44.0; // see asymmetry NOTE above - not a true half-span
 
         // Normalized position: -1 at low end, 0 at center, +1 at high end
         let x = (midi as f32 - center) / range;
@@ -86,7 +110,7 @@ impl StretchCurve {
 
 impl Default for StretchCurve {
     fn default() -> Self {
-        Self::new()
+        Self::railsback_default()
     }
 }
 
@@ -96,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_bass_is_flat() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // A0 should be significantly flat
         let a0 = curve.offset_cents(21);
@@ -109,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_treble_is_sharp() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // C8 should be significantly sharp
         let c8 = curve.offset_cents(108);
@@ -122,7 +146,7 @@ mod tests {
 
     #[test]
     fn test_middle_is_near_zero() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // A4 should be close to 0
         let a4 = curve.offset_cents(69);
@@ -135,7 +159,7 @@ mod tests {
 
     #[test]
     fn test_curve_is_monotonic() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // The entire curve should be monotonically increasing
         let mut prev = curve.offset_cents(21);
@@ -155,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_apply_stretch() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // A4 at 440Hz with minimal stretch should stay near 440
         let stretched = curve.apply(440.0, 69);
@@ -189,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_bounds_checking() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // Out of range should return 0
         assert_eq!(curve.offset_cents(20), 0.0);
@@ -205,7 +229,7 @@ mod tests {
     #[test]
     fn test_railsback_offsets_characterization() {
         // Index 0 = A0 (MIDI 21) ... index 87 = C8 (MIDI 108). Captured from
-        // StretchCurve::new() on the pre-refactor implementation via
+        // StretchCurve::new() (pre-refactor name; now railsback_default()) via
         // f32::to_bits() for exact reproduction (avoids decimal-literal
         // rounding drift).
         #[rustfmt::skip]
@@ -223,7 +247,7 @@ mod tests {
             f32::from_bits(1099623670), f32::from_bits(1100073213), f32::from_bits(1100533592), f32::from_bits(1101004800), f32::from_bits(1101486841), f32::from_bits(1101979715), f32::from_bits(1102483424), f32::from_bits(1102997961),
         ];
 
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
         for (i, &expected) in EXPECTED.iter().enumerate() {
             let midi = (i + 21) as u8;
             let actual = curve.offset_cents(midi);
@@ -249,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_stretch_magnitudes() {
-        let curve = StretchCurve::new();
+        let curve = StretchCurve::railsback_default();
 
         // Verify approximate magnitudes match Railsback expectations
         let a0 = curve.offset_cents(21);
