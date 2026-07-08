@@ -39,6 +39,12 @@ pub struct PitchDetector {
     threshold: f32,
     min_frequency: f32,
     max_frequency: f32,
+    // NOTE: shares the FFT plumbing in `spectrum::PartialAnalyzer` for the
+    // treble spectral refinement pass (issue #14) rather than reimplementing
+    // FFT peak-picking here. Kept separate from `partial_analyzer` because it
+    // only ever needs the fundamental (`with_max_partials(1)`), where the bass
+    // path wants partials 2-6.
+    partials: PartialAnalyzer,
     // NOTE: owned (not constructed per call) so the guided bass path (issue
     // #15) reuses the FFT planner's cached plans across strikes instead of
     // replanning on every frame.
@@ -54,6 +60,14 @@ impl PitchDetector {
     /// true-fundamental dip an octave down (gap >= ~0.012).
     const OCTAVE_MARGIN: f32 = 0.01;
 
+    /// Floor above which a coarse YIN candidate gets spectral refinement
+    /// (issue #14). Below this, the integer-lag grid is already fine enough
+    /// (a whole tau step is only a few cents at low frequency) that the extra
+    /// FFT is not worth the cost; above it the grid coarsens fast (~41
+    /// cents/step at C6, ~165 at C8) and three-point parabolic interpolation
+    /// on the CMND curve can't recover tuner-grade accuracy from it.
+    const SPECTRAL_REFINE_FLOOR_HZ: f32 = 1000.0;
+
     /// Create a new pitch detector.
     pub fn new(sample_rate: u32) -> Self {
         Self {
@@ -61,6 +75,9 @@ impl PitchDetector {
             threshold: 0.1,
             min_frequency: 27.5,   // A0
             max_frequency: 4186.0, // C8
+            // Only the fundamental is needed to refine YIN's candidate; skip
+            // searching for overtones the caller never asks for.
+            partials: PartialAnalyzer::new(sample_rate).with_max_partials(1),
             // Issue #15's fit only ever uses partials 2-6.
             partial_analyzer: PartialAnalyzer::new(sample_rate).with_max_partials(6),
         }
@@ -228,6 +245,7 @@ impl PitchDetector {
 
         let refined_tau = self.parabolic_interpolation(&cmnd, best);
         let frequency = self.sample_rate as f32 / refined_tau;
+        let frequency = self.refine_treble(samples, frequency);
 
         Ok(PitchResult {
             frequency,
@@ -316,6 +334,13 @@ impl PitchDetector {
 
         // Calculate frequency
         let frequency = self.sample_rate as f32 / refined_tau;
+
+        // Step 6: Spectral refinement (issue #14). The integer-lag grid is
+        // coarse in the treble (~165 cents/step at C8); re-reading the
+        // fundamental's magnitude peak from an FFT of this same window with
+        // sub-bin interpolation gets tuner-grade accuracy YIN's time-domain
+        // estimate cannot.
+        let frequency = self.refine_treble(samples, frequency);
 
         // Calculate confidence (1 - cmnd value at the dip)
         let confidence = 1.0 - cmnd[tau].min(1.0);
@@ -486,6 +511,24 @@ impl PitchDetector {
         let delta = (s0 - s2) / denominator;
 
         tau as f32 + delta.clamp(-1.0, 1.0)
+    }
+
+    /// Refine a coarse YIN candidate to its sub-bin FFT peak (issue #14).
+    ///
+    /// `samples` must be the same window YIN just analyzed, so the spectral
+    /// search band the analyzer builds around `coarse_hz` is centered on the
+    /// note actually being read. YIN stays the candidate/octave selector;
+    /// this only sharpens the estimate, and only above
+    /// [`Self::SPECTRAL_REFINE_FLOOR_HZ`] where the lag grid is coarse enough
+    /// to need it. Falls back to the coarse estimate unchanged if the
+    /// analyzer can't resolve a peak (e.g. a degenerate window).
+    fn refine_treble(&self, samples: &[f32], coarse_hz: f32) -> f32 {
+        if coarse_hz < Self::SPECTRAL_REFINE_FLOOR_HZ {
+            return coarse_hz;
+        }
+        self.partials
+            .refine_fundamental(samples, coarse_hz)
+            .unwrap_or(coarse_hz)
     }
 }
 
@@ -815,6 +858,47 @@ mod tests {
             result.frequency,
             error
         );
+    }
+
+    #[test]
+    fn test_detect_refines_treble_beyond_integer_lag_grid() {
+        // Issue #14: an integer YIN lag is a coarse grid (~41 cents/step at C6,
+        // ~165 at C8) that three-point parabolic interpolation on the CMND
+        // curve cannot beat down to tuner-grade. Spectral refinement (an FFT
+        // of the same window, sub-bin peak interpolation on the fundamental)
+        // must recover <1 cent on a clean tone.
+        for &freq in &[1046.502_f32, 2093.005, 4186.009] {
+            // C6, C7, C8
+            let source = TestAudioSource::sine(freq, 0.1, SAMPLE_RATE);
+            let result = PitchDetector::new(SAMPLE_RATE)
+                .detect(source.samples())
+                .unwrap_or_else(|e| panic!("should detect {freq} Hz: {e:?}"));
+            let cents = 1200.0 * (result.frequency / freq).log2().abs();
+            assert!(
+                cents < 1.0,
+                "freq={freq}: refined {} Hz is {cents:.3} cents off (expected <1)",
+                result.frequency
+            );
+        }
+    }
+
+    #[test]
+    fn test_detect_for_target_refines_treble_beyond_integer_lag_grid() {
+        // Same refinement, guided path: `main` calls `detect_for_target` for
+        // any note the app is actively tuning, so the spectral pass must fire
+        // there too, not only in the full-range `detect`.
+        for &freq in &[1046.502_f32, 2093.005, 4186.009] {
+            let source = TestAudioSource::sine(freq, 0.1, SAMPLE_RATE);
+            let result = PitchDetector::new(SAMPLE_RATE)
+                .detect_for_target(source.samples(), freq)
+                .unwrap_or_else(|e| panic!("should detect {freq} Hz: {e:?}"));
+            let cents = 1200.0 * (result.frequency / freq).log2().abs();
+            assert!(
+                cents < 1.0,
+                "freq={freq}: refined {} Hz is {cents:.3} cents off (expected <1)",
+                result.frequency
+            );
+        }
     }
 
     #[test]
