@@ -30,6 +30,9 @@ jobs:
       - name: Install ALSA dev headers
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      # Includes tests/smoke_cli.rs (#25): drives the compiled binary's
+      # `analyze` subcommand over a synthesized WAV, so this Ubuntu leg is
+      # the first thing to ever actually execute pianito on Linux.
       - run: cargo test --all-features
       - run: cargo build --release
 
