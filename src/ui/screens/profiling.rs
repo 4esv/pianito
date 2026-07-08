@@ -22,6 +22,10 @@ pub struct ProfilingScreen {
     current_freq: Option<f32>,
     /// Current cents deviation.
     current_cents: Option<f32>,
+    /// Current pitch-detection confidence, alongside `current_freq`/
+    /// `current_cents` (set/cleared together so a confirmed note always has
+    /// all three or none).
+    current_confidence: Option<f32>,
     /// Target frequency for the current note. Kept in sync by App so the
     /// info panel shows the same target the meter's cents are computed from.
     target_freq: f32,
@@ -38,6 +42,7 @@ impl ProfilingScreen {
             current_note_idx: 0,
             current_freq: None,
             current_cents: None,
+            current_confidence: None,
             // NOTE: pre-sync default only; App overwrites this via
             // set_target_freq with the stretch/a4-adjusted target
             target_freq: Temperament::new().frequency(NOTES[0].midi),
@@ -51,6 +56,11 @@ impl ProfilingScreen {
         self.tolerance = tolerance;
     }
 
+    /// Set the A4 reference frequency this profile is being measured under.
+    pub fn set_a4_reference(&mut self, a4_reference: f32) {
+        self.profile.set_a4_reference(a4_reference);
+    }
+
     /// Get the current note to profile.
     pub fn current_note(&self) -> &'static Note {
         &NOTES[self.current_note_idx]
@@ -61,16 +71,18 @@ impl ProfilingScreen {
         self.current_note_idx
     }
 
-    /// Update with detected pitch.
-    pub fn update(&mut self, freq: f32, cents: f32) {
+    /// Update with detected pitch and the detector's confidence in it.
+    pub fn update(&mut self, freq: f32, cents: f32, confidence: f32) {
         self.current_freq = Some(freq);
         self.current_cents = Some(cents);
+        self.current_confidence = Some(confidence);
     }
 
     /// Clear detected pitch (silence).
     pub fn clear(&mut self) {
         self.current_freq = None;
         self.current_cents = None;
+        self.current_confidence = None;
     }
 
     /// Set the target frequency for the current note.
@@ -91,16 +103,22 @@ impl ProfilingScreen {
     /// deviation and queues first (after the temperament octave). Use skip
     /// to pass over a note deliberately.
     pub fn confirm_note(&mut self) -> bool {
-        let (Some(freq), Some(cents)) = (self.current_freq, self.current_cents) else {
+        let (Some(freq), Some(cents), Some(confidence)) = (
+            self.current_freq,
+            self.current_cents,
+            self.current_confidence,
+        ) else {
             return false;
         };
 
         let note = self.current_note();
-        self.profile.record_note(note.midi, freq, cents);
+        self.profile
+            .record_note_with_context(note.midi, freq, cents, self.target_freq, confidence);
 
         self.current_note_idx += 1;
         self.current_freq = None;
         self.current_cents = None;
+        self.current_confidence = None;
 
         self.is_complete()
     }
@@ -111,6 +129,7 @@ impl ProfilingScreen {
         self.current_note_idx += 1;
         self.current_freq = None;
         self.current_cents = None;
+        self.current_confidence = None;
 
         self.is_complete()
     }
@@ -121,6 +140,7 @@ impl ProfilingScreen {
             self.current_note_idx -= 1;
             self.current_freq = None;
             self.current_cents = None;
+            self.current_confidence = None;
         }
     }
 
@@ -330,7 +350,7 @@ mod tests {
     #[test]
     fn test_confirm_records_at_current_index() {
         let mut screen = ProfilingScreen::new();
-        screen.update(27.5, 3.0);
+        screen.update(27.5, 3.0, 0.9);
 
         assert!(!screen.confirm_note());
         assert_eq!(screen.current_note_idx(), 1);
@@ -344,7 +364,7 @@ mod tests {
     #[test]
     fn test_confirm_clears_reading_for_next_note() {
         let mut screen = ProfilingScreen::new();
-        screen.update(27.5, 3.0);
+        screen.update(27.5, 3.0, 0.9);
         screen.confirm_note();
 
         // The old reading must not leak into the next note
@@ -355,7 +375,7 @@ mod tests {
     #[test]
     fn test_skip_advances_without_recording() {
         let mut screen = ProfilingScreen::new();
-        screen.update(27.5, 3.0);
+        screen.update(27.5, 3.0, 0.9);
 
         assert!(!screen.skip_note());
         assert_eq!(screen.current_note_idx(), 1);
@@ -383,7 +403,7 @@ mod tests {
         let mut screen = ProfilingScreen::new();
 
         for i in 0..88 {
-            screen.update(440.0, 1.0);
+            screen.update(440.0, 1.0, 0.9);
             let done = screen.confirm_note();
             assert_eq!(done, i == 87, "only the 88th confirm completes");
         }
@@ -398,6 +418,23 @@ mod tests {
         let mut screen = ProfilingScreen::new();
         screen.set_target_freq(27.3);
         assert!((screen.target_freq() - 27.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_confirm_records_measurement_context() {
+        // #20: the note recorded on confirm must carry the a4 reference,
+        // the target it was measured against, and detection confidence.
+        let mut screen = ProfilingScreen::new();
+        screen.set_a4_reference(442.0);
+        screen.set_target_freq(27.3);
+        screen.update(27.5, 3.0, 0.87);
+
+        assert!(!screen.confirm_note());
+
+        assert!((screen.profile().a4_reference - 442.0).abs() < 0.01);
+        let recorded = screen.profile().notes[0].as_ref().expect("A0 recorded");
+        assert!((recorded.target_freq - 27.3).abs() < 0.01);
+        assert!((recorded.confidence - 0.87).abs() < 0.01);
     }
 
     #[test]
