@@ -12,6 +12,53 @@
 //! inharmonicity. Consumers (`App::target_for_midi`) only ever call
 //! `offset_cents()` / `apply()`, so adding builders is the entire surface
 //! those issues need.
+//!
+//! `StretchMode` (issue #19) is the user-selectable surface over those
+//! builders: `off` / `railsback` / `profile`, wired through CLI + config into
+//! [`StretchMode::resolve`].
+
+use serde::{Deserialize, Serialize};
+
+use super::profile::PianoProfile;
+
+/// User-selectable stretch application mode (CLI `--stretch` / config file
+/// `stretch` key). Doc comments double as `clap` `--help` text for each
+/// value, so keep them short and user-facing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum StretchMode {
+    /// No stretch: pure equal-temperament targets.
+    Off,
+    /// The built-in Railsback-inspired curve (same for every piano).
+    #[default]
+    Railsback,
+    /// The per-piano curve measured from a loaded profile (falls back to
+    /// Railsback when none is loaded).
+    Profile,
+}
+
+// NOTE: `Profile` falls back to `Railsback` in `resolve` below rather than
+// silently reverting to pure equal temperament when no profile is loaded
+// yet. `StretchCurve::from_profile` is the literal measured-deviation table
+// today; issue #23's fitted inharmonicity model replaces just that builder,
+// not this enum or its CLI/config surface.
+
+impl StretchMode {
+    /// Resolve this mode into a concrete curve (or `None` for no stretch).
+    /// `profile` is the currently loaded piano profile, if any; `Profile`
+    /// mode without one falls back to the Railsback default rather than
+    /// silently reverting to pure equal temperament.
+    pub fn resolve(self, profile: Option<&PianoProfile>) -> Option<StretchCurve> {
+        match self {
+            StretchMode::Off => None,
+            StretchMode::Railsback => Some(StretchCurve::railsback_default()),
+            StretchMode::Profile => Some(match profile {
+                Some(profile) => StretchCurve::from_profile(profile),
+                None => StretchCurve::railsback_default(),
+            }),
+        }
+    }
+}
 
 /// Stretch tuning curve: per-key cents offsets from equal temperament.
 ///
@@ -39,6 +86,21 @@ impl StretchCurve {
     /// the "temperament zone", and treble notes go progressively sharp.
     pub fn railsback_default() -> Self {
         Self::from_offsets(Self::generate_railsback_curve())
+    }
+
+    /// Build a curve from a loaded profile's measured per-key deviations
+    /// (`ProfiledNote::cents`), i.e. the piano's own measured stretch rather
+    /// than a generic population curve. Keys the profile never measured
+    /// (skipped notes, or an incomplete profile) keep 0.0 (no stretch) at
+    /// that index.
+    pub fn from_profile(profile: &PianoProfile) -> Self {
+        let mut offsets = [0.0_f32; 88];
+        for (offset, note) in offsets.iter_mut().zip(profile.notes.iter()) {
+            if let Some(note) = note {
+                *offset = note.cents;
+            }
+        }
+        Self::from_offsets(offsets)
     }
 
     /// Get the stretch offset in cents for a given MIDI note.
@@ -293,5 +355,63 @@ mod tests {
             "C8 stretch {} out of expected range",
             c8
         );
+    }
+
+    #[test]
+    fn test_stretch_mode_defaults_to_railsback() {
+        assert_eq!(StretchMode::default(), StretchMode::Railsback);
+    }
+
+    #[test]
+    fn test_stretch_mode_off_resolves_to_none() {
+        assert!(StretchMode::Off.resolve(None).is_none());
+        // A loaded profile must not override an explicit `off`.
+        assert!(StretchMode::Off
+            .resolve(Some(&PianoProfile::new()))
+            .is_none());
+    }
+
+    #[test]
+    fn test_stretch_mode_railsback_resolves_to_railsback_curve() {
+        let curve = StretchMode::Railsback.resolve(None).expect("some curve");
+        assert_eq!(
+            curve.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_stretch_mode_profile_without_profile_falls_back_to_railsback() {
+        let curve = StretchMode::Profile
+            .resolve(None)
+            .expect("falls back to some curve");
+        assert_eq!(
+            curve.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_stretch_mode_profile_with_profile_uses_measured_curve() {
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -12.5); // A0, measured 12.5 cents flat
+
+        let curve = StretchMode::Profile
+            .resolve(Some(&profile))
+            .expect("some curve");
+        assert_eq!(curve.offset_cents(21), -12.5);
+        // Unmeasured keys stay at 0 (no stretch), not the Railsback value.
+        assert_eq!(curve.offset_cents(108), 0.0);
+    }
+
+    #[test]
+    fn test_from_profile_uses_measured_cents_and_zero_for_unmeasured_keys() {
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 440.0, 3.25); // A4
+
+        let curve = StretchCurve::from_profile(&profile);
+        assert_eq!(curve.offset_cents(69), 3.25);
+        assert_eq!(curve.offset_cents(21), 0.0);
+        assert_eq!(curve.offset_cents(108), 0.0);
     }
 }
