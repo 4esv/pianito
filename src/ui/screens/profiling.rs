@@ -8,6 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+use crate::audio::Partial;
 use crate::tuning::notes::{Note, NOTES};
 use crate::tuning::profile::PianoProfile;
 use crate::tuning::temperament::Temperament;
@@ -31,6 +32,11 @@ pub struct ProfilingScreen {
     target_freq: f32,
     /// In-tune tolerance in cents (from config; drives the meter zone).
     tolerance: f32,
+    /// Partials measured from the audio window backing `current_freq`/
+    /// `current_cents` (issue #22). Set by `App` alongside `update`, once a
+    /// raw audio window is available to run the FFT analyzer against; empty
+    /// until then, or after `clear`/`confirm_note`/`skip_note`/`go_back`.
+    current_partials: Vec<Partial>,
     /// The profile being built.
     profile: PianoProfile,
 }
@@ -47,6 +53,7 @@ impl ProfilingScreen {
             // set_target_freq with the stretch/a4-adjusted target
             target_freq: Temperament::new().frequency(NOTES[0].midi),
             tolerance: 5.0,
+            current_partials: Vec::new(),
             profile: PianoProfile::new(),
         }
     }
@@ -83,6 +90,19 @@ impl ProfilingScreen {
         self.current_freq = None;
         self.current_cents = None;
         self.current_confidence = None;
+        self.current_partials = Vec::new();
+    }
+
+    /// Record the partial spectrum backing the current reading (issue #22).
+    /// Called by `App` alongside `update`, once a raw audio window is
+    /// available to analyze.
+    pub fn set_current_partials(&mut self, partials: Vec<Partial>) {
+        self.current_partials = partials;
+    }
+
+    /// The partials measured for the current reading, if any.
+    pub fn current_partials(&self) -> &[Partial] {
+        &self.current_partials
     }
 
     /// Set the target frequency for the current note.
@@ -112,8 +132,18 @@ impl ProfilingScreen {
         };
 
         let note = self.current_note();
-        self.profile
-            .record_note_with_context(note.midi, freq, cents, self.target_freq, confidence);
+        // Record the reading with BOTH its measurement context (#20: the
+        // target it was measured against + detection confidence) and its
+        // captured partial spectrum (#22), together in one note.
+        let partials = std::mem::take(&mut self.current_partials);
+        self.profile.record_note_full(
+            note.midi,
+            freq,
+            cents,
+            self.target_freq,
+            confidence,
+            partials,
+        );
 
         self.current_note_idx += 1;
         self.current_freq = None;
@@ -130,6 +160,7 @@ impl ProfilingScreen {
         self.current_freq = None;
         self.current_cents = None;
         self.current_confidence = None;
+        self.current_partials = Vec::new();
 
         self.is_complete()
     }
@@ -141,6 +172,7 @@ impl ProfilingScreen {
             self.current_freq = None;
             self.current_cents = None;
             self.current_confidence = None;
+            self.current_partials = Vec::new();
         }
     }
 
@@ -359,6 +391,87 @@ mod tests {
         let recorded = screen.profile().notes[0].as_ref().expect("A0 recorded");
         assert_eq!(recorded.midi, 21);
         assert!((recorded.cents - 3.0).abs() < 0.01);
+    }
+
+    fn sample_partials() -> Vec<Partial> {
+        vec![
+            Partial {
+                n: 1,
+                freq_hz: 27.6,
+                amplitude: 0.2,
+            },
+            Partial {
+                n: 2,
+                freq_hz: 55.3,
+                amplitude: 1.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn test_confirm_persists_current_partials() {
+        let mut screen = ProfilingScreen::new();
+        screen.update(27.5, 3.0, 0.9);
+        screen.set_current_partials(sample_partials());
+
+        assert_eq!(screen.current_partials(), sample_partials().as_slice());
+        screen.confirm_note();
+
+        let recorded = screen.profile().notes[0].as_ref().expect("A0 recorded");
+        assert_eq!(recorded.partials, sample_partials());
+    }
+
+    #[test]
+    fn test_confirm_without_partials_records_empty() {
+        let mut screen = ProfilingScreen::new();
+        screen.update(27.5, 3.0, 0.9);
+        screen.confirm_note();
+
+        let recorded = screen.profile().notes[0].as_ref().expect("A0 recorded");
+        assert!(recorded.partials.is_empty());
+    }
+
+    #[test]
+    fn test_confirm_does_not_leak_partials_into_next_note() {
+        let mut screen = ProfilingScreen::new();
+        screen.update(27.5, 3.0, 0.9);
+        screen.set_current_partials(sample_partials());
+        screen.confirm_note();
+
+        // Next note's reading arrives with no partials set yet.
+        screen.update(55.0, -1.0, 0.9);
+        screen.confirm_note();
+
+        let recorded = screen.profile().notes[1].as_ref().expect("A#0 recorded");
+        assert!(
+            recorded.partials.is_empty(),
+            "stale partials from the previous note must not carry over"
+        );
+    }
+
+    #[test]
+    fn test_clear_resets_partials() {
+        let mut screen = ProfilingScreen::new();
+        screen.set_current_partials(sample_partials());
+        screen.clear();
+        assert!(screen.current_partials().is_empty());
+    }
+
+    #[test]
+    fn test_skip_note_resets_partials() {
+        let mut screen = ProfilingScreen::new();
+        screen.set_current_partials(sample_partials());
+        screen.skip_note();
+        assert!(screen.current_partials().is_empty());
+    }
+
+    #[test]
+    fn test_go_back_resets_partials() {
+        let mut screen = ProfilingScreen::new();
+        screen.skip_note();
+        screen.set_current_partials(sample_partials());
+        screen.go_back();
+        assert!(screen.current_partials().is_empty());
     }
 
     #[test]

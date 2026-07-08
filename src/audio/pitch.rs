@@ -143,7 +143,11 @@ impl PitchDetector {
     /// short for treble (sub-second sustain, strike transient decays fast).
     /// Boundaries at C2 / C4 / C6 (equal temperament, A4 = 440); a couple Hz
     /// of A4 calibration drift never crosses one.
-    fn window_for_target(target_hz: f32) -> Duration {
+    ///
+    /// Public so other per-note analysis (e.g. profiling's partial capture,
+    /// issue #22) can reuse the same register tiering instead of
+    /// reimplementing it.
+    pub fn window_for_target(target_hz: f32) -> Duration {
         if target_hz < 65.406 {
             Duration::from_millis(400) // below C2
         } else if target_hz < 261.626 {
