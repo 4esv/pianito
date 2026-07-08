@@ -33,9 +33,23 @@ impl ProfiledNote {
     }
 }
 
+/// Current on-disk schema version for [`PianoProfile`].
+const SCHEMA_VERSION: u32 = 1;
+
+/// Default for the `version` field when it's absent from the JSON.
+///
+/// Profiles saved before this field existed predate versioning entirely, so
+/// treating them as `1` is correct, not just a filler value.
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 /// A complete piano profile with measurements for all 88 keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PianoProfile {
+    /// Schema version. See [`default_schema_version`].
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
     /// Unique profile ID (ISO 8601 timestamp).
     pub id: String,
     /// Measurements for each note (index 0 = A0, index 87 = C8).
@@ -49,6 +63,7 @@ impl PianoProfile {
     pub fn new() -> Self {
         let now = Utc::now();
         Self {
+            version: SCHEMA_VERSION,
             id: now.to_rfc3339(),
             notes: vec![None; NOTE_COUNT],
             created_at: now,
@@ -315,6 +330,50 @@ mod tests {
         assert_eq!(loaded.notes.len(), NOTE_COUNT);
         assert!(loaded.notes[48].is_some(), "Measured note survives");
         assert!(loaded.notes[87].is_none(), "Missing slots pad with None");
+    }
+
+    #[test]
+    fn test_new_profile_has_current_schema_version() {
+        assert_eq!(PianoProfile::new().version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_load_defaults_version_for_pre_version_profiles() {
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("pre_version.json");
+
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 442.0, 7.85);
+
+        // Strip `version` to simulate a profile saved before it existed.
+        let mut value = serde_json::to_value(&profile).expect("Should serialize");
+        value
+            .as_object_mut()
+            .expect("profile object")
+            .remove("version");
+        fs::write(&path, value.to_string()).expect("Should write file");
+
+        let loaded = PianoProfile::load(&path).expect("Should load");
+        assert_eq!(loaded.version, 1);
+    }
+
+    #[test]
+    fn test_load_pre_version_fixture_upgrades_to_v1() {
+        // Hand-written fixture matching the real on-disk shape saved by
+        // pianito before `version` existed (no derived-then-stripped value).
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("fixture.json");
+
+        let fixture = r#"{
+            "id": "2024-01-01T00:00:00+00:00",
+            "notes": [],
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        fs::write(&path, fixture).expect("Should write fixture");
+
+        let loaded = PianoProfile::load(&path).expect("pre-version fixture must still load");
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.notes.len(), NOTE_COUNT);
     }
 
     #[test]
