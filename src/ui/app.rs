@@ -364,6 +364,7 @@ impl App {
         self.temperament = Temperament::with_a4(self.configured_a4);
         let mut profiling = ProfilingScreen::new();
         profiling.set_tolerance(self.tolerance);
+        profiling.set_a4_reference(self.configured_a4);
         self.profiling = Some(profiling);
         self.state = AppState::Profiling;
         self.sync_profiling_target();
@@ -518,7 +519,7 @@ impl App {
                         // panel agree
                         let target = profiling.target_freq();
                         let cents = self.temperament.cents_from_target(freq, target);
-                        profiling.update(freq, cents);
+                        profiling.update(freq, cents, confidence);
                     } else {
                         profiling.clear();
                     }
