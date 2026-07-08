@@ -196,6 +196,57 @@ mod tests {
         assert_eq!(curve.offset_cents(109), 0.0);
     }
 
+    // NOTE: characterization test for issue #18 - pins the exact per-note
+    // stretch offsets produced by the pre-refactor implementation, bit for
+    // bit. This is the proof that the data/builder refactor changed no
+    // observable behavior: it must stay green, unmodified in its expected
+    // values, across the refactor commit (only the constructor call below is
+    // renamed alongside the production call sites).
+    #[test]
+    fn test_railsback_offsets_characterization() {
+        // Index 0 = A0 (MIDI 21) ... index 87 = C8 (MIDI 108). Captured from
+        // StretchCurve::new() on the pre-refactor implementation via
+        // f32::to_bits() for exact reproduction (avoids decimal-literal
+        // rounding drift).
+        #[rustfmt::skip]
+        const EXPECTED: [f32; 88] = [
+            f32::from_bits(3246090155), f32::from_bits(3245256062), f32::from_bits(3244443631), f32::from_bits(3243652866), f32::from_bits(3242883766), f32::from_bits(3242136330), f32::from_bits(3241410560), f32::from_bits(3240706455),
+            f32::from_bits(3240024013), f32::from_bits(3239363237), f32::from_bits(3238724127), f32::from_bits(3238106678), f32::from_bits(3237019108), f32::from_bits(3235870871), f32::from_bits(3234765967), f32::from_bits(3233704393),
+            f32::from_bits(3232686147), f32::from_bits(3231711232), f32::from_bits(3230779645), f32::from_bits(3229891390), f32::from_bits(3228478846), f32::from_bits(3226875650), f32::from_bits(3225359114), f32::from_bits(3223929239),
+            f32::from_bits(3222586021), f32::from_bits(3221329462), f32::from_bits(3219093655), f32::from_bits(3216927177), f32::from_bits(3214934016), f32::from_bits(3213114174), f32::from_bits(3210098434), f32::from_bits(3207152023),
+            f32::from_bits(3204552246), f32::from_bits(3200149961), f32::from_bits(3196336958), f32::from_bits(3190374807), f32::from_bits(3183372745), f32::from_bits(3173597591), f32::from_bits(3156820375), f32::from_bits(0),
+            f32::from_bits(1009336727), f32::from_bits(1026113943), f32::from_bits(1035889097), f32::from_bits(1042891159), f32::from_bits(1048853310), f32::from_bits(1052666313), f32::from_bits(1057068598), f32::from_bits(1059668375),
+            f32::from_bits(1062614786), f32::from_bits(1065630526), f32::from_bits(1067450368), f32::from_bits(1069443529), f32::from_bits(1071610007), f32::from_bits(1073845814), f32::from_bits(1075102373), f32::from_bits(1076445591),
+            f32::from_bits(1077875466), f32::from_bits(1079392002), f32::from_bits(1080995198), f32::from_bits(1082407742), f32::from_bits(1083295997), f32::from_bits(1084227584), f32::from_bits(1085202499), f32::from_bits(1086220745),
+            f32::from_bits(1087282319), f32::from_bits(1088387223), f32::from_bits(1089535460), f32::from_bits(1090623030), f32::from_bits(1091240479), f32::from_bits(1091879589), f32::from_bits(1092540365), f32::from_bits(1093222807),
+            f32::from_bits(1093926912), f32::from_bits(1094652682), f32::from_bits(1095400118), f32::from_bits(1096169218), f32::from_bits(1096959983), f32::from_bits(1097772414), f32::from_bits(1098606507), f32::from_bits(1099184958),
+            f32::from_bits(1099623670), f32::from_bits(1100073213), f32::from_bits(1100533592), f32::from_bits(1101004800), f32::from_bits(1101486841), f32::from_bits(1101979715), f32::from_bits(1102483424), f32::from_bits(1102997961),
+        ];
+
+        let curve = StretchCurve::new();
+        for (i, &expected) in EXPECTED.iter().enumerate() {
+            let midi = (i + 21) as u8;
+            let actual = curve.offset_cents(midi);
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "MIDI {} offset drifted: expected {} ({:#010x}), got {} ({:#010x})",
+                midi,
+                expected,
+                expected.to_bits(),
+                actual,
+                actual.to_bits()
+            );
+        }
+
+        // Spot-check readable landmarks against the issue's own numbers so a
+        // future reader can sanity-check the bit table above at a glance.
+        assert!((curve.offset_cents(21) - (-15.712_81)).abs() < 0.001); // A0
+        assert!(curve.offset_cents(60).abs() < 0.001); // C4
+        assert!((curve.offset_cents(69) - 0.836_776_85).abs() < 0.001); // A4
+        assert!((curve.offset_cents(108) - 23.801_653).abs() < 0.001); // C8
+    }
+
     #[test]
     fn test_stretch_magnitudes() {
         let curve = StretchCurve::new();
