@@ -109,7 +109,7 @@ impl App {
             beep_enabled: false,
             beep_pending: false,
             in_tune_latched: false,
-            stretch: Some(StretchCurve::new()),
+            stretch: Some(StretchCurve::railsback_default()),
             save_error: None,
             resume_warning: None,
             audio_warning: None,
@@ -179,7 +179,7 @@ impl App {
 
     /// Enable or disable stretch tuning (Railsback curve).
     pub fn set_stretch(&mut self, enabled: bool) {
-        self.stretch = enabled.then(StretchCurve::new);
+        self.stretch = enabled.then(StretchCurve::railsback_default);
     }
 
     /// Error from the most recent save (session or profile), if any. Also
