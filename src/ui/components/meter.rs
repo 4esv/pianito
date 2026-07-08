@@ -1,6 +1,6 @@
 //! Cents deviation meter component.
 
-use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+use ratatui::{buffer::Buffer, layout::Rect, style::Modifier, widgets::Widget};
 
 use crate::ui::theme::{BoxChars, Theme};
 
@@ -48,6 +48,16 @@ impl Meter {
 }
 
 impl Meter {
+    /// Pivot (in cents) for the tick/label/out-of-zone log curve.
+    ///
+    /// Kept fixed, rather than pivoting on `tolerance` as the ticks used to,
+    /// because pivoting on tolerance always maps `tolerance` itself to
+    /// offset 0, which makes it impossible to derive a non-zero in-tune
+    /// zone width from "where does tolerance land". A fixed cent value
+    /// keeps ticks and the zone on the same curve, so they agree at any
+    /// width or tolerance.
+    const LOG_SCALE_PIVOT_CENTS: f32 = 1.0;
+
     /// Convert cents to screen position using logarithmic scale.
     /// Values within ±tolerance return 0 (center).
     /// Values outside use log scale: more resolution near center, compressed at edges.
@@ -64,6 +74,33 @@ impl Meter {
         let normalized = (abs_cents / tolerance).ln() / (max_cents / tolerance).ln();
 
         sign * normalized.clamp(0.0, 1.0) * half_width
+    }
+
+    /// Half-width (in the same units as `half_width`, i.e. character
+    /// columns) of the in-tune zone, derived from `tolerance` instead of a
+    /// fixed character count. This is literally "the +tolerance x-position"
+    /// on the same pivoted log curve used for ticks, so the drawn zone edge
+    /// lines up with wherever a `tolerance`-cents reading would otherwise be
+    /// plotted.
+    pub fn zone_half_width(tolerance: f32, max_cents: f32, half_width: f32) -> f32 {
+        Self::log_position(
+            tolerance,
+            max_cents,
+            half_width,
+            Self::LOG_SCALE_PIVOT_CENTS,
+        )
+    }
+
+    /// Map cents within tolerance linearly across the in-tune zone, so
+    /// movement finer than tolerance still shows up as needle movement
+    /// (sub-tolerance drift) instead of collapsing to a single dead-center
+    /// point. Returns an offset in the same units as `zone_half_width`;
+    /// callers add it to the zone's center x-position.
+    pub fn sub_tolerance_offset(cents: f32, tolerance: f32, zone_half_width: f32) -> f32 {
+        if tolerance <= 0.0 {
+            return 0.0;
+        }
+        (cents / tolerance).clamp(-1.0, 1.0) * zone_half_width
     }
 }
 
@@ -93,7 +130,12 @@ impl Widget for Meter {
             if label.is_empty() {
                 continue;
             }
-            let x_offset = Self::log_position(cents as f32, max_cents, half_width, self.tolerance);
+            let x_offset = Self::log_position(
+                cents as f32,
+                max_cents,
+                half_width,
+                Self::LOG_SCALE_PIVOT_CENTS,
+            );
             let x = (center_x as f32 + x_offset) as u16;
             if x >= area.x && x + label.len() as u16 <= area.x + area.width {
                 let style = if cents == 0 {
@@ -120,8 +162,12 @@ impl Widget for Meter {
             let y = meter_y_start + row;
 
             for &tick_cents in &tick_values {
-                let x_offset =
-                    Self::log_position(tick_cents as f32, max_cents, half_width, self.tolerance);
+                let x_offset = Self::log_position(
+                    tick_cents as f32,
+                    max_cents,
+                    half_width,
+                    Self::LOG_SCALE_PIVOT_CENTS,
+                );
                 let x = (center_x as f32 + x_offset) as u16;
                 if x >= area.x && x < area.x + area.width {
                     let char = if tick_cents == 0 {
@@ -139,30 +185,55 @@ impl Widget for Meter {
             }
         }
 
-        // Fixed in-tune zone width (in characters)
-        let in_tune_zone_width: u16 = 7;
-
         // Draw the indicator if detecting
         if self.detecting {
             let style = Theme::style_for_cents(self.cents);
 
             if self.cents.abs() <= self.tolerance {
-                // Within tolerance: draw fixed, wide green zone at center (no movement)
-                let half_zone = in_tune_zone_width / 2;
+                // Within tolerance: zone width is derived from tolerance
+                // (see `zone_half_width`), not a fixed character count, so
+                // it agrees with the tick marks at any tolerance or width.
+                let zone_half_width = Self::zone_half_width(self.tolerance, max_cents, half_width);
+                let half_zone = zone_half_width.round() as u16;
                 let start_x = center_x.saturating_sub(half_zone).max(area.x);
                 let end_x = (center_x + half_zone + 1).min(area.x + area.width);
+
+                // Sub-tolerance drift: map cents linearly across the zone so
+                // fine settling is still visible instead of the needle
+                // teleporting to a static, information-free block.
+                let needle_offset =
+                    Self::sub_tolerance_offset(self.cents, self.tolerance, zone_half_width);
+                let needle_x = (center_x as i32 + needle_offset.round() as i32)
+                    .clamp(area.x as i32, area.x as i32 + area.width as i32 - 1)
+                    as u16;
+                let needle_style = Theme::accent().add_modifier(Modifier::BOLD);
 
                 for row in 0..meter_height {
                     let y = meter_y_start + row;
                     for x in start_x..end_x {
-                        buf.set_string(x, y, "█", style);
+                        if x == needle_x {
+                            // Brighter cell within the zone: shows exactly
+                            // where inside the tolerance the reading sits.
+                            buf.set_string(
+                                x,
+                                y,
+                                BoxChars::THICK_VERTICAL.to_string(),
+                                needle_style,
+                            );
+                        } else {
+                            buf.set_string(x, y, "█", style);
+                        }
                     }
                 }
             } else {
                 // Outside tolerance: narrow indicator at logarithmic position
                 let clamped_cents = self.cents.clamp(-max_cents, max_cents);
-                let x_offset =
-                    Self::log_position(clamped_cents, max_cents, half_width, self.tolerance);
+                let x_offset = Self::log_position(
+                    clamped_cents,
+                    max_cents,
+                    half_width,
+                    Self::LOG_SCALE_PIVOT_CENTS,
+                );
                 let indicator_x = (center_x as f32 + x_offset) as u16;
 
                 // Narrow indicator (1-2 chars) when out of tune
@@ -393,5 +464,161 @@ mod tests {
 
         let pos = Meter::log_position(-5.0001, 500.0, 50.0, 5.0);
         assert!(pos < 0.0, "Just below tolerance should be negative");
+    }
+
+    // -- in-tune zone width, derived from tolerance (issue #33) --
+
+    #[test]
+    fn test_zone_half_width_matches_hand_computed_value() {
+        // Same log curve as `log_position`, pivoted at 1 cent instead of at
+        // `tolerance` (pivoting on tolerance itself always maps tolerance to
+        // offset 0, which can't yield a non-zero zone width).
+        let expected = (5f32).ln() / (500f32).ln() * 50.0;
+        let actual = Meter::zone_half_width(5.0, 500.0, 50.0);
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn test_zone_half_width_grows_with_tolerance() {
+        let narrow = Meter::zone_half_width(5.0, 500.0, 50.0);
+        let wide = Meter::zone_half_width(10.0, 500.0, 50.0);
+        assert!(
+            wide > narrow,
+            "a looser tolerance must draw a wider zone: {wide} should be > {narrow}"
+        );
+    }
+
+    #[test]
+    fn test_zone_half_width_is_not_the_old_hardcoded_constant() {
+        // The bug this fixes: a fixed 7-wide block regardless of tolerance
+        // or terminal width. At this width/tolerance the derived value must
+        // differ from the old hardcoded half (3).
+        let actual = Meter::zone_half_width(5.0, 500.0, 50.0);
+        assert!(
+            (actual - 3.0).abs() > 0.5,
+            "zone width must be derived, not the old fixed 7-wide block"
+        );
+    }
+
+    #[test]
+    fn test_zone_half_width_reaches_full_width_at_max_cents() {
+        let actual = Meter::zone_half_width(500.0, 500.0, 50.0);
+        assert!((actual - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_zone_half_width_zero_at_or_below_pivot() {
+        assert_eq!(Meter::zone_half_width(1.0, 500.0, 50.0), 0.0);
+        assert_eq!(Meter::zone_half_width(0.5, 500.0, 50.0), 0.0);
+    }
+
+    #[test]
+    fn test_zone_half_width_scales_with_terminal_width() {
+        let narrow_term = Meter::zone_half_width(5.0, 500.0, 20.0);
+        let wide_term = Meter::zone_half_width(5.0, 500.0, 60.0);
+        assert!(wide_term > narrow_term);
+    }
+
+    // -- sub-tolerance drift: fine movement inside the zone (issue #33) --
+
+    #[test]
+    fn test_sub_tolerance_offset_at_center_is_zero() {
+        assert_eq!(Meter::sub_tolerance_offset(0.0, 5.0, 10.0), 0.0);
+    }
+
+    #[test]
+    fn test_sub_tolerance_offset_at_tolerance_boundary_reaches_zone_edge() {
+        // This is what makes the zone and the log-scale ticks agree: at
+        // cents == tolerance, sub-tolerance drift lands exactly on
+        // `zone_half_width`, the same x-position where the log curve
+        // (pivoted the same way) starts for values just past tolerance.
+        assert_eq!(Meter::sub_tolerance_offset(5.0, 5.0, 10.0), 10.0);
+        assert_eq!(Meter::sub_tolerance_offset(-5.0, 5.0, 10.0), -10.0);
+    }
+
+    #[test]
+    fn test_sub_tolerance_offset_is_linear() {
+        assert_eq!(Meter::sub_tolerance_offset(2.5, 5.0, 10.0), 5.0);
+        assert_eq!(Meter::sub_tolerance_offset(-1.25, 5.0, 10.0), -2.5);
+    }
+
+    #[test]
+    fn test_sub_tolerance_offset_clamps_beyond_tolerance() {
+        // Defensive: callers only pass cents within tolerance, but the
+        // mapping must not overshoot the zone if they don't.
+        assert_eq!(Meter::sub_tolerance_offset(8.0, 5.0, 10.0), 10.0);
+        assert_eq!(Meter::sub_tolerance_offset(-8.0, 5.0, 10.0), -10.0);
+    }
+
+    #[test]
+    fn test_sub_tolerance_offset_zero_tolerance_does_not_panic() {
+        assert_eq!(Meter::sub_tolerance_offset(1.0, 0.0, 10.0), 0.0);
+    }
+
+    // -- rendering: zone width and needle placement actually drawn --
+
+    fn meter_row_symbols(area: Rect, buf: &Buffer, y: u16) -> Vec<String> {
+        (area.x..area.x + area.width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_render_zone_width_matches_computed_value() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        let meter = Meter::new(0.0).tolerance(5.0);
+        meter.render(area, &mut buf);
+
+        let half_width = (area.width / 2 - 1) as f32;
+        let expected_half = Meter::zone_half_width(5.0, 500.0, half_width).round() as u16;
+        let center_x = area.x + area.width / 2;
+        let y = area.y + 2; // meter_y_start
+
+        let row = meter_row_symbols(area, &buf, y);
+        let block = "█".to_string();
+        let needle = BoxChars::THICK_VERTICAL.to_string();
+
+        for x in (center_x - expected_half)..=(center_x + expected_half) {
+            let symbol = &row[(x - area.x) as usize];
+            assert!(
+                *symbol == block || *symbol == needle,
+                "cell at {x} should be inside the computed in-tune zone, got {symbol:?}"
+            );
+        }
+        assert_ne!(
+            row[(center_x - expected_half - 1 - area.x) as usize],
+            block,
+            "cell just outside the computed zone must not be filled"
+        );
+    }
+
+    #[test]
+    fn test_render_needle_shows_sub_tolerance_drift() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        // Half of tolerance: within the in-tune zone, but off-center.
+        let meter = Meter::new(2.5).tolerance(5.0);
+        meter.render(area, &mut buf);
+
+        let half_width = (area.width / 2 - 1) as f32;
+        let zone_half = Meter::zone_half_width(5.0, 500.0, half_width);
+        let needle_offset = Meter::sub_tolerance_offset(2.5, 5.0, zone_half);
+        let center_x = area.x + area.width / 2;
+        let needle_x = (center_x as f32 + needle_offset).round() as u16;
+        let y = area.y + 2;
+
+        assert_ne!(
+            needle_x, center_x,
+            "test setup should pick a drifting reading"
+        );
+        assert_eq!(
+            buf[(needle_x, y)].symbol(),
+            BoxChars::THICK_VERTICAL.to_string(),
+            "needle must be visible at its sub-tolerance position"
+        );
     }
 }

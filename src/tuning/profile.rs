@@ -19,6 +19,17 @@ pub struct ProfiledNote {
     pub frequency: f32,
     /// Deviation from target in cents.
     pub cents: f32,
+    /// Target frequency `cents` was measured against: equal temperament
+    /// plus whatever stretch curve was in effect at measurement time.
+    /// `0.0` (unknown) for notes recorded before this field existed, or via
+    /// the bare [`PianoProfile::record_note`] convenience.
+    #[serde(default)]
+    pub target_freq: f32,
+    /// Pitch-detection confidence (0.0-1.0) at the moment this note was
+    /// confirmed. `0.0` (unknown, not necessarily "no confidence") for notes
+    /// recorded before this field existed.
+    #[serde(default)]
+    pub confidence: f32,
     /// When this measurement was taken.
     pub timestamp: DateTime<Utc>,
     /// Measured partials (n=1..~8) from the FFT analyzer (issue #22), the
@@ -30,17 +41,31 @@ pub struct ProfiledNote {
 }
 
 impl ProfiledNote {
-    /// Create a new profiled note with no partial data.
+    /// Create a new profiled note with no measurement context or partials.
+    /// Convenience for synthetic profiles (tests, `TuningOrder`); real
+    /// measurements carry context + partials via
+    /// [`ProfiledNote::with_context_and_partials`].
     pub fn new(midi: u8, frequency: f32, cents: f32) -> Self {
-        Self::with_partials(midi, frequency, cents, Vec::new())
+        Self::with_context_and_partials(midi, frequency, cents, 0.0, 0.0, Vec::new())
     }
 
-    /// Create a new profiled note, including its measured partial spectrum.
-    pub fn with_partials(midi: u8, frequency: f32, cents: f32, partials: Vec<Partial>) -> Self {
+    /// Create a new profiled note with full measurement context (target
+    /// frequency + detection confidence, issue #20) and its measured partial
+    /// spectrum (issue #22).
+    pub fn with_context_and_partials(
+        midi: u8,
+        frequency: f32,
+        cents: f32,
+        target_freq: f32,
+        confidence: f32,
+        partials: Vec<Partial>,
+    ) -> Self {
         Self {
             midi,
             frequency,
             cents,
+            target_freq,
+            confidence,
             timestamp: Utc::now(),
             partials,
         }
@@ -66,6 +91,11 @@ pub struct PianoProfile {
     pub version: u32,
     /// Unique profile ID (ISO 8601 timestamp).
     pub id: String,
+    /// A4 reference frequency (Hz) in effect while this profile was
+    /// measured. `0.0` (unknown) for profiles saved before this field
+    /// existed.
+    #[serde(default)]
+    pub a4_reference: f32,
     /// Measurements for each note (index 0 = A0, index 87 = C8).
     pub notes: Vec<Option<ProfiledNote>>,
     /// When this profile was created.
@@ -79,14 +109,37 @@ impl PianoProfile {
         Self {
             version: SCHEMA_VERSION,
             id: now.to_rfc3339(),
+            a4_reference: 0.0,
             notes: vec![None; NOTE_COUNT],
             created_at: now,
         }
     }
 
-    /// Record a note measurement.
+    /// Set the A4 reference frequency this profile is being measured under.
+    pub fn set_a4_reference(&mut self, a4_reference: f32) {
+        self.a4_reference = a4_reference;
+    }
+
+    /// Record a note measurement without measurement context (target
+    /// frequency, detection confidence) or partials. Kept for callers
+    /// building synthetic profiles (tests, `TuningOrder`); real measurements
+    /// from the profiling flow should use [`Self::record_note_full`] instead.
     pub fn record_note(&mut self, midi: u8, frequency: f32, cents: f32) {
-        self.record_note_with_partials(midi, frequency, cents, Vec::new());
+        self.record_note_full(midi, frequency, cents, 0.0, 0.0, Vec::new());
+    }
+
+    /// Record a note measurement along with the target frequency it was
+    /// measured against and the pitch-detection confidence at the time
+    /// (issue #20).
+    pub fn record_note_with_context(
+        &mut self,
+        midi: u8,
+        frequency: f32,
+        cents: f32,
+        target_freq: f32,
+        confidence: f32,
+    ) {
+        self.record_note_full(midi, frequency, cents, target_freq, confidence, Vec::new());
     }
 
     /// Record a note measurement along with its measured partial spectrum
@@ -99,10 +152,32 @@ impl PianoProfile {
         cents: f32,
         partials: Vec<Partial>,
     ) {
+        self.record_note_full(midi, frequency, cents, 0.0, 0.0, partials);
+    }
+
+    /// Record a note measurement with full measurement context (issue #20:
+    /// target frequency + detection confidence) AND its measured partial
+    /// spectrum (issue #22). The profiling confirm path uses this so a
+    /// confirmed note carries the target it was measured against, the
+    /// detection confidence, and the overtone structure together.
+    pub fn record_note_full(
+        &mut self,
+        midi: u8,
+        frequency: f32,
+        cents: f32,
+        target_freq: f32,
+        confidence: f32,
+        partials: Vec<Partial>,
+    ) {
         if let Some(idx) = Self::midi_to_index(midi) {
             if idx < self.notes.len() {
-                self.notes[idx] = Some(ProfiledNote::with_partials(
-                    midi, frequency, cents, partials,
+                self.notes[idx] = Some(ProfiledNote::with_context_and_partials(
+                    midi,
+                    frequency,
+                    cents,
+                    target_freq,
+                    confidence,
+                    partials,
                 ));
             }
         }
@@ -403,6 +478,116 @@ mod tests {
         let loaded = PianoProfile::load(&path).expect("pre-version fixture must still load");
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.notes.len(), NOTE_COUNT);
+    }
+
+    // -- Measurement context (#20): a4 reference, stretch target, confidence --
+
+    #[test]
+    fn test_record_note_with_context_stores_target_and_confidence() {
+        let mut profile = PianoProfile::new();
+        profile.set_a4_reference(442.0);
+        profile.record_note_with_context(69, 442.0, 7.85, 441.5, 0.92); // A4
+
+        assert!((profile.a4_reference - 442.0).abs() < 0.01);
+
+        let note = profile.notes[48].as_ref().expect("A4 should be recorded");
+        assert_eq!(note.midi, 69);
+        assert!((note.target_freq - 441.5).abs() < 0.01);
+        assert!((note.confidence - 0.92).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_serialize_deserialize_roundtrip_preserves_measurement_context() {
+        let mut profile = PianoProfile::new();
+        profile.set_a4_reference(442.0);
+        profile.record_note_with_context(21, 27.5, 1.0, 27.4, 0.75); // A0
+        profile.record_note_with_context(69, 442.0, 7.85, 441.5, 0.92); // A4
+
+        let json = serde_json::to_string(&profile).expect("Should serialize");
+        let restored: PianoProfile = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert!((restored.a4_reference - 442.0).abs() < 0.01);
+
+        let a0 = restored.notes[0].as_ref().expect("A0 recorded");
+        assert!((a0.target_freq - 27.4).abs() < 0.01);
+        assert!((a0.confidence - 0.75).abs() < 0.01);
+
+        let a4 = restored.notes[48].as_ref().expect("A4 recorded");
+        assert!((a4.target_freq - 441.5).abs() < 0.01);
+        assert!((a4.confidence - 0.92).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_load_defaults_measurement_context_for_pre_context_profiles() {
+        // Simulates a profile saved before a4_reference/target_freq/confidence
+        // existed: derived-then-stripped, same pattern as the version test
+        // above.
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("pre_context.json");
+
+        let mut profile = PianoProfile::new();
+        profile.record_note(69, 442.0, 7.85);
+
+        let mut value = serde_json::to_value(&profile).expect("Should serialize");
+        let obj = value.as_object_mut().expect("profile object");
+        obj.remove("a4_reference");
+        let notes = obj
+            .get_mut("notes")
+            .expect("notes")
+            .as_array_mut()
+            .expect("notes array");
+        for note in notes.iter_mut() {
+            if let Some(note_obj) = note.as_object_mut() {
+                note_obj.remove("target_freq");
+                note_obj.remove("confidence");
+            }
+        }
+        fs::write(&path, value.to_string()).expect("Should write file");
+
+        let loaded = PianoProfile::load(&path).expect("pre-context profile must still load");
+        assert_eq!(
+            loaded.a4_reference, 0.0,
+            "missing a4_reference defaults to 0.0 (unknown)"
+        );
+
+        let a4 = loaded.notes[48].as_ref().expect("A4 recorded");
+        assert_eq!(
+            a4.target_freq, 0.0,
+            "missing target_freq defaults to 0.0 (unknown)"
+        );
+        assert_eq!(
+            a4.confidence, 0.0,
+            "missing confidence defaults to 0.0 (unknown)"
+        );
+    }
+
+    #[test]
+    fn test_load_pre_context_fixture_still_loads() {
+        // Hand-written fixture matching the real on-disk shape saved by
+        // pianito before measurement context existed.
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("pre_context_fixture.json");
+
+        let fixture = r#"{
+            "version": 1,
+            "id": "2024-01-01T00:00:00+00:00",
+            "notes": [
+                {
+                    "midi": 69,
+                    "frequency": 442.0,
+                    "cents": 7.85,
+                    "timestamp": "2024-01-01T00:00:00+00:00"
+                }
+            ],
+            "created_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        fs::write(&path, fixture).expect("Should write fixture");
+
+        let loaded = PianoProfile::load(&path).expect("pre-context fixture must still load");
+        assert_eq!(loaded.a4_reference, 0.0);
+        let a4 = loaded.notes[0].as_ref().expect("note recorded");
+        assert_eq!(a4.target_freq, 0.0);
+        assert_eq!(a4.confidence, 0.0);
     }
 
     #[test]
