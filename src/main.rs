@@ -239,6 +239,9 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     } else {
         App::with_config(&config)
     };
+    // Drives the partial analyzer's register window (issue #22); must match
+    // the real device rate, not the `App::new` placeholder.
+    app.set_sample_rate(sample_rate);
 
     // Audio output for the lock beep (config/--beep). Opened before the TUI
     // so a missing output device degrades to a status-line warning instead
@@ -302,6 +305,9 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
                 Ok(pitch_result) => {
                     let smoothed = pitch_filter.push(pitch_result.frequency);
                     app.update_pitch(smoothed, pitch_result.confidence);
+                    // Captures the partial spectrum for the inharmonicity fit
+                    // (issue #22/#23); a no-op outside Profiling.
+                    app.capture_profiling_partials(smoothed, pitch_result.confidence, slice);
                 }
                 Err(_) => {
                     // Silence/lost detection re-arms the window so the next strike

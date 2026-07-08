@@ -3,6 +3,7 @@
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, widgets::Paragraph, Frame};
 
+use crate::audio::{PartialAnalyzer, PitchDetector};
 use crate::config::EffectiveConfig;
 use crate::tuning::flow::TuningFlow;
 use crate::tuning::order::TuningOrder;
@@ -81,9 +82,22 @@ pub struct App {
     resume_warning: Option<String>,
     /// Most recent audio-stream error reported by the capture backend.
     audio_warning: Option<String>,
+    /// Sample rate of the active audio input. Defaults to a placeholder
+    /// until `main` calls `set_sample_rate` once the real device is open;
+    /// only used to size the partial analyzer's register window (issue #22).
+    sample_rate: u32,
+    /// FFT partial analyzer used to capture each profiled note's overtone
+    /// structure at confirm time (issue #22). Rebuilt by `set_sample_rate`
+    /// so its bin-width math matches the real device rate.
+    partial_analyzer: PartialAnalyzer,
 }
 
 impl App {
+    /// Placeholder sample rate before `set_sample_rate` is called with the
+    /// real device rate. Never reaches a real analysis: `main` sets the
+    /// actual rate before the capture loop starts.
+    const DEFAULT_SAMPLE_RATE: u32 = 44_100;
+
     /// Create a new application.
     pub fn new() -> Self {
         Self {
@@ -106,6 +120,8 @@ impl App {
             save_error: None,
             resume_warning: None,
             audio_warning: None,
+            sample_rate: Self::DEFAULT_SAMPLE_RATE,
+            partial_analyzer: PartialAnalyzer::new(Self::DEFAULT_SAMPLE_RATE),
         }
     }
 
@@ -210,6 +226,50 @@ impl App {
     /// terminal is in raw mode.
     pub fn set_audio_warning(&mut self, msg: String) {
         self.audio_warning = Some(msg);
+    }
+
+    /// Set the sample rate of the active audio input (called once by `main`
+    /// after the mic opens). Rebuilds the partial analyzer so its internal
+    /// bin-width math matches the real device rate (issue #22).
+    pub fn set_sample_rate(&mut self, sample_rate: u32) {
+        self.sample_rate = sample_rate;
+        self.partial_analyzer = PartialAnalyzer::new(sample_rate);
+    }
+
+    /// Confidence floor below which a pitch reading is treated as noise
+    /// during profiling. Mirrors the floor `update_pitch`'s Profiling arm
+    /// gates the frequency/cents reading on, so partial capture describes
+    /// the same reading rather than a rejected one.
+    const PROFILING_CONFIDENCE_FLOOR: f32 = 0.6;
+
+    /// Capture the partial spectrum backing the current profiling reading
+    /// (issue #22): analyzes `samples` (the raw audio window that produced
+    /// `freq`) so confirming the note can persist `Vec<Partial>` alongside
+    /// it, for the future inharmonicity fit (issue #23).
+    ///
+    /// No-op outside `Profiling`, or below [`Self::PROFILING_CONFIDENCE_FLOOR`].
+    pub fn capture_profiling_partials(&mut self, freq: f32, confidence: f32, samples: &[f32]) {
+        if confidence <= Self::PROFILING_CONFIDENCE_FLOOR || self.state != AppState::Profiling {
+            return;
+        }
+        let Some(profiling) = &mut self.profiling else {
+            return;
+        };
+
+        // Bass notes get the whole window; treble is trimmed to its shorter
+        // register window (the same tiering `PitchDetector::detect_for_target`
+        // uses) so a long buffer's decayed tail or the next strike doesn't
+        // dilute the FFT.
+        let window = PitchDetector::window_for_target(profiling.target_freq());
+        let want = (self.sample_rate as f64 * window.as_secs_f64()).round() as usize;
+        let trimmed = if want > 0 && samples.len() > want {
+            &samples[samples.len() - want..]
+        } else {
+            samples
+        };
+
+        let partials = self.partial_analyzer.analyze(trimmed, freq);
+        profiling.set_current_partials(partials);
     }
 
     /// Drain the pending beep request. Returns true at most once per lock:
@@ -770,6 +830,7 @@ impl Default for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::TestAudioSource;
 
     fn test_config(a4: f32) -> EffectiveConfig {
         EffectiveConfig {
@@ -1158,5 +1219,95 @@ mod tests {
         let profiling = app.profiling.as_ref().unwrap();
         let expected = app.target_for_midi(profiling.current_note().midi);
         assert!((profiling.target_freq() - expected).abs() < f32::EPSILON);
+    }
+
+    // ---- Partial spectra capture during profiling (issue #22) -------------
+
+    const TEST_SAMPLE_RATE: u32 = 44_100;
+
+    /// App in Profiling state with a known sample rate.
+    fn profiling_app() -> App {
+        let mut app = App::with_config(&test_config(440.0));
+        app.mode_select.select(SelectedMode::Profile);
+        app.start_session();
+        app.set_sample_rate(TEST_SAMPLE_RATE);
+        assert_eq!(app.state(), AppState::Profiling);
+        app
+    }
+
+    #[test]
+    fn test_capture_profiling_partials_matches_analyzer_output() {
+        let mut app = profiling_app();
+
+        // A0 is deep bass: window_for_target keeps the whole (short, in this
+        // test) buffer, so what's captured must equal the analyzer run
+        // directly on the same samples.
+        let f0 = 27.5;
+        let b = 0.009;
+        let src = TestAudioSource::inharmonic(
+            f0,
+            b,
+            &[(1, 0.05), (2, 1.0), (3, 0.9), (4, 0.7), (5, 0.5)],
+            0.3,
+            TEST_SAMPLE_RATE,
+        );
+
+        app.capture_profiling_partials(f0, 0.9, src.samples());
+
+        let expected = PartialAnalyzer::new(TEST_SAMPLE_RATE).analyze(src.samples(), f0);
+        assert!(!expected.is_empty(), "fixture must yield partials");
+
+        let profiling = app.profiling.as_ref().unwrap();
+        assert_eq!(profiling.current_partials(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_capture_profiling_partials_ignored_outside_profiling() {
+        let mut app = concert_app();
+        app.set_sample_rate(TEST_SAMPLE_RATE);
+        let src = TestAudioSource::inharmonic(440.0, 0.0, &[(1, 1.0)], 0.1, TEST_SAMPLE_RATE);
+
+        // Must not panic; Tuning state has no profiling screen to record into.
+        app.capture_profiling_partials(440.0, 0.9, src.samples());
+        assert!(app.profiling.is_none());
+    }
+
+    #[test]
+    fn test_capture_profiling_partials_below_confidence_floor_is_noop() {
+        let mut app = profiling_app();
+        let src =
+            TestAudioSource::inharmonic(27.5, 0.009, &[(2, 1.0), (3, 0.8)], 0.3, TEST_SAMPLE_RATE);
+
+        app.capture_profiling_partials(27.5, 0.5, src.samples());
+
+        let profiling = app.profiling.as_ref().unwrap();
+        assert!(profiling.current_partials().is_empty());
+    }
+
+    #[test]
+    fn test_capture_profiling_partials_trims_to_register_window() {
+        let mut app = profiling_app();
+        // Force a treble target (window_for_target trims to 60ms above C6)
+        // regardless of which note is actually "current".
+        app.profiling.as_mut().unwrap().set_target_freq(2000.0);
+
+        let f0 = 2000.0;
+        let src =
+            TestAudioSource::inharmonic(f0, 0.0, &[(1, 1.0), (2, 0.5)], 0.3, TEST_SAMPLE_RATE);
+        let samples = src.samples();
+
+        app.capture_profiling_partials(f0, 0.9, samples);
+
+        let want = (TEST_SAMPLE_RATE as f64 * 0.06).round() as usize;
+        assert_ne!(
+            want,
+            samples.len(),
+            "fixture must be long enough to actually exercise trimming"
+        );
+        let trimmed = &samples[samples.len() - want..];
+        let expected = PartialAnalyzer::new(TEST_SAMPLE_RATE).analyze(trimmed, f0);
+
+        let profiling = app.profiling.as_ref().unwrap();
+        assert_eq!(profiling.current_partials(), expected.as_slice());
     }
 }
