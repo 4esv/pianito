@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Widget},
 };
 
+use crate::tuning::session::TuningMode;
 use crate::ui::theme::{Shortcuts, Theme};
 
 /// Selected tuning mode.
@@ -34,6 +35,19 @@ impl SelectedMode {
             Self::QuickTune => "Calibrate to the piano's current pitch center, then tune all strings relative to that. Best for regular maintenance.",
             Self::ConcertPitch => "Tune all strings to standard concert pitch (A4 = 440 Hz). Use for pianos that are already close to pitch.",
             Self::Profile => "Play all 88 keys (A0→C8) to measure deviations, then tune worst notes first while preserving the temperament octave.",
+        }
+    }
+}
+
+impl From<SelectedMode> for TuningMode {
+    /// The single source of truth for the selected-mode -> tuning-mode
+    /// mapping (previously duplicated verbatim in `start_session` and
+    /// `start_tuning`).
+    fn from(mode: SelectedMode) -> Self {
+        match mode {
+            SelectedMode::QuickTune => TuningMode::Quick,
+            SelectedMode::ConcertPitch => TuningMode::Concert,
+            SelectedMode::Profile => TuningMode::Profile,
         }
     }
 }
@@ -199,5 +213,20 @@ fn render_mode_option(mode: SelectedMode, is_selected: bool, area: Rect, buf: &m
             desc.to_string()
         };
         buf.set_string(inner.x + 2, inner.y + 1, &truncated, Theme::muted());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_selected_mode_maps_to_tuning_mode() {
+        assert_eq!(TuningMode::from(SelectedMode::QuickTune), TuningMode::Quick);
+        assert_eq!(
+            TuningMode::from(SelectedMode::ConcertPitch),
+            TuningMode::Concert
+        );
+        assert_eq!(TuningMode::from(SelectedMode::Profile), TuningMode::Profile);
     }
 }
