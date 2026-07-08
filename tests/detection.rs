@@ -4,8 +4,7 @@
 //! synthesizes a physically realistic tone for every key (inharmonic partial
 //! stack, register-dependent rolloff, weak/absent bass fundamental, attack
 //! transient, per-partial decay, -30 dB noise — see [`fixtures`]) and runs it
-//! through the *production* detection path: 100 ms windows, the default
-//! [`PitchDetector`], and the [`MedianFilter`] the interactive loop uses.
+//! through the production detection path.
 //!
 //! Every earlier test fed the detector pure sines, so "194 green" coexisted
 //! with a product that fails across roughly three octaves. This corpus makes
@@ -15,12 +14,15 @@
 //!   This is the regression guard — if the mid range ever drifts, CI breaks.
 //! - **Note-level lock (C2–C8):** must at least identify the correct note, even
 //!   where the cents accuracy is not yet tuner-grade.
-//! - **Known-limitation keys:** the bright, partial-rich bass and the stiff
-//!   treble drag a time-domain estimator sharp (> 5 cents), and the weak-
-//!   fundamental deep bass (A0–B1) will not lock at all. These are asserted to
-//!   *still fail* so that when the FFT partial analyzer lands (bass f0 #15,
-//!   treble refinement #14) the harness forces the baseline to be promoted
-//!   rather than letting the win go unnoticed.
+//! - **Bass f0 recovery (A0–B2, issue #15):** the weak/absent fundamental
+//!   defeats a time-domain estimator outright, so this band is scored via
+//!   guided mode's real call path (`detect_for_target`) rather than the blind
+//!   scan the rest of the corpus uses — see [`detect_lock_bass`] for why.
+//! - **Known-limitation keys:** the stiff treble and a residual sliver of
+//!   bass still drag a time-domain estimate sharp (> 5 cents). Asserted to
+//!   *still fail* so that when treble refinement (#14) lands, the harness
+//!   forces the baseline to be promoted rather than letting the win go
+//!   unnoticed.
 
 mod fixtures;
 
@@ -53,11 +55,19 @@ const RELIABLE: RangeInclusive<u8> = 60..=84;
 /// C2–C8: the fundamental is present, so the correct *note* must be identified
 /// (cents may still be out of tolerance in the known-fail bands below).
 const RIGHT_NOTE: RangeInclusive<u8> = 36..=108;
-/// A0–B1: weak/absent fundamental. No reliable lock until bass f0 (#15) lands.
-const DEEP_BASS: RangeInclusive<u8> = 21..=35;
-/// C2–F#3: right note, but inharmonic partials pull the estimate > 5 cents
-/// sharp. Tracked for the partial-analysis refinement (#14 / #15).
-const KNOWN_FAIL_BASS: RangeInclusive<u8> = 36..=54;
+/// A0–B2: weak/absent fundamental, previously unrecoverable by a time-domain
+/// estimator at all. Promoted by issue #15's partial-based f0 estimator,
+/// which `detect_for_target` now routes to below C3 (mirrors
+/// `PitchDetector::BASS_PARTIAL_MAX_TARGET_HZ` — the two must stay in sync
+/// for this band to mean what it says). Scored through
+/// [`detect_lock_bass`], not the blind [`detect_lock`]: guided mode always
+/// knows the target here (this app has no free-listening mode), so blind
+/// detection could never observe the fix this band exists to pin.
+const BASS_PARTIAL_RECOVERED: RangeInclusive<u8> = 21..=47;
+/// C3–F#3: right note, but inharmonic partials still pull the plain YIN
+/// clamp > 5 cents sharp. Below issue #15's target register; a residual left
+/// for future work.
+const KNOWN_FAIL_BASS: RangeInclusive<u8> = 48..=54;
 /// C7–C8: stiff-string inharmonicity plus the coarse integer-lag grid at high
 /// frequency push the estimate > 5 cents sharp. Tracked for treble refinement
 /// (#14).
@@ -84,11 +94,16 @@ impl Lock {
     }
 }
 
-/// Run the production detection path over an in-memory WAV and report the
-/// stabilized lock. Mirrors `main.rs`: 100 ms windows, default detector,
-/// median-filtered stream with the filter cleared on lost frames. The lock is
-/// the median of the smoothed stream — the sustained pitch, robust to a stray
-/// attack-frame outlier.
+/// Run the *blind* production detection path over an in-memory WAV and report
+/// the stabilized lock: 100 ms windows, the target-agnostic
+/// [`PitchDetector::detect`], median-filtered stream with the filter cleared
+/// on lost frames. The lock is the median of the smoothed stream — the
+/// sustained pitch, robust to a stray attack-frame outlier.
+///
+/// This is deliberately the harder of the app's two call paths (see
+/// [`detect_lock_bass`] for the guided one): it is what pins the
+/// reliable/note-lock/known-fail bands above [`BASS_PARTIAL_RECOVERED`],
+/// none of which issue #15 touches.
 fn detect_lock(wav: &[u8]) -> Lock {
     let mut source = WavAudioSource::new(Cursor::new(wav.to_vec())).expect("valid WAV");
     let detector = PitchDetector::new(SAMPLE_RATE);
@@ -112,11 +127,67 @@ fn detect_lock(wav: &[u8]) -> Lock {
         }
     }
 
+    lock_from_stream(&temperament, &smoothed)
+}
+
+/// Run guided mode's real call path ([`PitchDetector::detect_for_target`])
+/// over an in-memory WAV and report the stabilized lock.
+///
+/// [`detect_lock`]'s blind scan can never observe issue #15's fix: this crate
+/// has no free-listening mode (`main.rs` calls `detect_for_target` whenever a
+/// note is being tuned, i.e. essentially always), and the partial-based bass
+/// estimator only activates when it is *given* a target. Scoring the
+/// weak-fundamental register through the blind path would leave that whole
+/// band permanently unrecoverable in the harness regardless of how good the
+/// estimator gets — the corpus would be asserting a real product capability
+/// can never happen.
+///
+/// Simulates the interactive loop's growing capture read (audio accumulates
+/// in the ring buffer between ~50 ms poll ticks) by sliding a
+/// [`PitchDetector::MAX_WINDOW`]-sized window forward in 100 ms hops over the
+/// whole decoded note, so the bass path sees the same long, onset-trailing
+/// view of the signal `main.rs` hands it.
+fn detect_lock_bass(wav: &[u8], target_hz: f32) -> Lock {
+    let mut source = WavAudioSource::new(Cursor::new(wav.to_vec())).expect("valid WAV");
+    let mut all = vec![0.0f32; (SAMPLE_RATE as f32 * FIXTURE_SECS) as usize + SAMPLE_RATE as usize];
+    let n = source.read_samples(&mut all);
+    let all = &all[..n];
+
+    let detector = PitchDetector::new(SAMPLE_RATE);
+    let temperament = Temperament::new();
+    let mut filter = MedianFilter::new(MedianFilter::DEFAULT_WINDOW);
+
+    let window = PitchDetector::max_window_samples(SAMPLE_RATE);
+    let hop = SAMPLE_RATE as usize / 10; // 100 ms
+    let mut smoothed: Vec<f32> = Vec::new();
+
+    if all.len() < window {
+        return Lock::None;
+    }
+    let mut end = window;
+    loop {
+        match detector.detect_for_target(&all[..end], target_hz) {
+            Ok(result) => smoothed.push(filter.push(result.frequency)),
+            Err(_) => filter.clear(),
+        }
+        if end >= all.len() {
+            break;
+        }
+        end = (end + hop).min(all.len());
+    }
+
+    lock_from_stream(&temperament, &smoothed)
+}
+
+/// Shared tail of both lock functions: the median of a smoothed pitch stream,
+/// resolved to the nearest note.
+fn lock_from_stream(temperament: &Temperament, smoothed: &[f32]) -> Lock {
     if smoothed.is_empty() {
         return Lock::None;
     }
-    smoothed.sort_unstable_by(f32::total_cmp);
-    let f_lock = smoothed[smoothed.len() / 2];
+    let mut sorted = smoothed.to_vec();
+    sorted.sort_unstable_by(f32::total_cmp);
+    let f_lock = sorted[sorted.len() / 2];
     match temperament.nearest_note(f_lock) {
         Some((midi, cents)) => Lock::Note {
             midi,
@@ -141,10 +212,10 @@ struct KeyReport {
 impl KeyReport {
     fn category(&self) -> &'static str {
         let m = self.midi;
-        if DEEP_BASS.contains(&m) {
-            "deep-bass (#15)"
+        if BASS_PARTIAL_RECOVERED.contains(&m) {
+            "bass-recovered (#15)"
         } else if KNOWN_FAIL_BASS.contains(&m) {
-            "bass-sharp (#14/#15)"
+            "bass-sharp (residual)"
         } else if RELIABLE.contains(&m) {
             "reliable"
         } else if KNOWN_FAIL_TREBLE.contains(&m) {
@@ -178,14 +249,21 @@ impl KeyReport {
 }
 
 /// Synthesize and detect every key A0..=C8.
+///
+/// [`BASS_PARTIAL_RECOVERED`] keys are scored through guided mode's real call
+/// path ([`detect_lock_bass`]); everything else through the blind scan
+/// ([`detect_lock`]) — see that function's doc comment for why the split is
+/// necessary rather than incidental.
 fn build_report() -> Vec<KeyReport> {
     (MIDI_MIN..=MIDI_MAX)
         .map(|midi| {
             let wav = fixtures::synth_wav(midi, SAMPLE_RATE, FIXTURE_SECS);
-            KeyReport {
-                midi,
-                lock: detect_lock(&wav),
-            }
+            let lock = if BASS_PARTIAL_RECOVERED.contains(&midi) {
+                detect_lock_bass(&wav, fundamental_hz(midi))
+            } else {
+                detect_lock(&wav)
+            };
+            KeyReport { midi, lock }
         })
         .collect()
 }
@@ -228,22 +306,25 @@ fn synthetic_corpus_matches_detection_baseline() {
             ));
         }
 
-        // Known-limitation keys must still fail: a pass means the detector
-        // improved (e.g. #14 / #15 landed) and the baseline must be promoted.
-        let tracked = KNOWN_FAIL_BASS.contains(&m) || KNOWN_FAIL_TREBLE.contains(&m);
-        if tracked && r.lock.passes(m) {
+        // Bass f0 recovery (issue #15): the partial-based estimator must
+        // deliver a tuner-grade lock across the whole weak-fundamental
+        // register, scored via guided mode's real call path
+        // (`detect_lock_bass`).
+        if BASS_PARTIAL_RECOVERED.contains(&m) && !r.lock.passes(m) {
             violations.push(format!(
-                "[promote] {} now locks within tolerance — the accuracy work for its \
-                 register (#14/#15) has progressed; move it into the reliable baseline",
+                "[regress] {} lost its bass f0 recovery (#15) — no longer locks \
+                 within tolerance",
                 key_label(m)
             ));
         }
 
-        // Deep bass must not reliably lock until #15 recovers the weak f0.
-        if DEEP_BASS.contains(&m) && r.lock.passes(m) {
+        // Known-limitation keys must still fail: a pass means the detector
+        // improved (e.g. #14 landed) and the baseline must be promoted.
+        let tracked = KNOWN_FAIL_BASS.contains(&m) || KNOWN_FAIL_TREBLE.contains(&m);
+        if tracked && r.lock.passes(m) {
             violations.push(format!(
-                "[promote-bass] {} now locks within tolerance — bass f0 recovery (#15) \
-                 has progressed; move it into the reliable baseline",
+                "[promote] {} now locks within tolerance — the accuracy work for its \
+                 register has progressed; move it into the reliable baseline",
                 key_label(m)
             ));
         }
