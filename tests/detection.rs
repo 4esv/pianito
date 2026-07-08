@@ -11,16 +11,18 @@
 //! with a product that fails across roughly three octaves. This corpus makes
 //! those failures visible and pins them to a baseline:
 //!
-//! - **Reliable register (C4–C6):** must lock the right note within 5 cents.
-//!   This is the regression guard — if the mid range ever drifts, CI breaks.
+//! - **Reliable registers (C4–C6, C7–C8):** must lock the right note within 5
+//!   cents. This is the regression guard — if either range ever drifts, CI
+//!   breaks. The treble half was promoted here by issue #14's spectral
+//!   refinement (see the note on [`RELIABLE_TREBLE`] for what "5 cents"
+//!   means once the corpus's own inharmonicity model is accounted for).
 //! - **Note-level lock (C2–C8):** must at least identify the correct note, even
 //!   where the cents accuracy is not yet tuner-grade.
-//! - **Known-limitation keys:** the bright, partial-rich bass and the stiff
-//!   treble drag a time-domain estimator sharp (> 5 cents), and the weak-
-//!   fundamental deep bass (A0–B1) will not lock at all. These are asserted to
-//!   *still fail* so that when the FFT partial analyzer lands (bass f0 #15,
-//!   treble refinement #14) the harness forces the baseline to be promoted
-//!   rather than letting the win go unnoticed.
+//! - **Known-limitation keys:** the bright, partial-rich bass drags a
+//!   time-domain estimator sharp (> 5 cents), and the weak-fundamental deep
+//!   bass (A0–B1) will not lock at all. These are asserted to *still fail* so
+//!   that when bass f0 recovery (#15) lands the harness forces the baseline
+//!   to be promoted rather than letting the win go unnoticed.
 
 mod fixtures;
 
@@ -31,7 +33,7 @@ use pianito::audio::{AudioSource, MedianFilter, PartialAnalyzer, PitchDetector, 
 use pianito::tuning::notes::Note;
 use pianito::tuning::temperament::Temperament;
 
-use fixtures::{fundamental_hz, MIDI_MAX, MIDI_MIN, SAMPLE_RATE};
+use fixtures::{fundamental_hz, inharmonicity_b, MIDI_MAX, MIDI_MIN, SAMPLE_RATE};
 
 /// Fixture length. 0.7 s is an exact multiple of the 100 ms production window
 /// (seven windows), so the harness never feeds the detector a short runt frame,
@@ -58,10 +60,25 @@ const DEEP_BASS: RangeInclusive<u8> = 21..=35;
 /// C2–F#3: right note, but inharmonic partials pull the estimate > 5 cents
 /// sharp. Tracked for the partial-analysis refinement (#14 / #15).
 const KNOWN_FAIL_BASS: RangeInclusive<u8> = 36..=54;
-/// C7–C8: stiff-string inharmonicity plus the coarse integer-lag grid at high
-/// frequency push the estimate > 5 cents sharp. Tracked for treble refinement
-/// (#14).
-const KNOWN_FAIL_TREBLE: RangeInclusive<u8> = 96..=108;
+/// C7–C8: promoted by issue #14's spectral refinement pass. Once YIN's
+/// coarse candidate (a ~41-to-165-cents/step integer-lag grid up here) is
+/// re-read from the FFT peak of the same window, the detector's reading of
+/// the *actual played fundamental* is precise to a small fraction of a cent
+/// (see `pianito::audio::pitch::tests::test_detect_refines_treble_beyond_integer_lag_grid`
+/// and this module's own `treble_spectral_refinement_locks_the_true_partial_within_one_cent`).
+///
+/// What's left of the ~1–4 cent reading here is *not* residual detector
+/// error: it is the corpus's own stiff-string model. `synth_note` places
+/// partial 1 at `f0 * sqrt(1 + B)`, and treble `B` (issue #17: up to 0.005 at
+/// C8, see `fixtures::inharmonicity_b`) stretches that real partial sharp of
+/// the flat equal-tempered grid this harness's note-lock scores against —
+/// about 2.3 cents at C7 growing to 4.3 at C8. A detector with *zero* error
+/// would still read exactly that offset here. Reconciling it is a tuning
+/// concern (a Railsback-style stretch curve, #22/#23's inharmonicity
+/// engine), not a detection one, so this band still clears the same 5-cent
+/// bar as [`RELIABLE`] rather than getting a bespoke looser tolerance for
+/// treble.
+const RELIABLE_TREBLE: RangeInclusive<u8> = 96..=108;
 
 /// What the harness resolved a fixture to.
 #[derive(Debug, Clone, Copy)]
@@ -84,15 +101,15 @@ impl Lock {
     }
 }
 
-/// Run the production detection path over an in-memory WAV and report the
-/// stabilized lock. Mirrors `main.rs`: 100 ms windows, default detector,
-/// median-filtered stream with the filter cleared on lost frames. The lock is
-/// the median of the smoothed stream — the sustained pitch, robust to a stray
-/// attack-frame outlier.
-fn detect_lock(wav: &[u8]) -> Lock {
+/// Run the production detection path over an in-memory WAV and return the
+/// stabilized frequency lock. Mirrors `main.rs`: 100 ms windows, default
+/// detector, median-filtered stream with the filter cleared on lost frames.
+/// The lock is the median of the smoothed stream — the sustained pitch,
+/// robust to a stray attack-frame outlier. `None` if no window ever produced
+/// a confident, in-range pitch.
+fn detect_lock_frequency(wav: &[u8]) -> Option<f32> {
     let mut source = WavAudioSource::new(Cursor::new(wav.to_vec())).expect("valid WAV");
     let detector = PitchDetector::new(SAMPLE_RATE);
-    let temperament = Temperament::new();
     let mut filter = MedianFilter::new(MedianFilter::DEFAULT_WINDOW);
 
     let window = SAMPLE_RATE as usize / 10; // 100 ms, matches the interactive loop
@@ -113,15 +130,24 @@ fn detect_lock(wav: &[u8]) -> Lock {
     }
 
     if smoothed.is_empty() {
-        return Lock::None;
+        return None;
     }
     smoothed.sort_unstable_by(f32::total_cmp);
-    let f_lock = smoothed[smoothed.len() / 2];
-    match temperament.nearest_note(f_lock) {
-        Some((midi, cents)) => Lock::Note {
-            midi,
-            cents,
-            freq: f_lock,
+    Some(smoothed[smoothed.len() / 2])
+}
+
+/// [`detect_lock_frequency`] plus the nearest-note lookup the accuracy table
+/// and baseline checks score against.
+fn detect_lock(wav: &[u8]) -> Lock {
+    let temperament = Temperament::new();
+    match detect_lock_frequency(wav) {
+        Some(f_lock) => match temperament.nearest_note(f_lock) {
+            Some((midi, cents)) => Lock::Note {
+                midi,
+                cents,
+                freq: f_lock,
+            },
+            None => Lock::None,
         },
         None => Lock::None,
     }
@@ -147,8 +173,8 @@ impl KeyReport {
             "bass-sharp (#14/#15)"
         } else if RELIABLE.contains(&m) {
             "reliable"
-        } else if KNOWN_FAIL_TREBLE.contains(&m) {
-            "treble-sharp (#14)"
+        } else if RELIABLE_TREBLE.contains(&m) {
+            "reliable-treble (#14)"
         } else {
             "transition"
         }
@@ -212,10 +238,10 @@ fn synthetic_corpus_matches_detection_baseline() {
     for r in &report {
         let m = r.midi;
 
-        // Regression guard: the reliable register must stay tuner-grade.
-        if RELIABLE.contains(&m) && !r.lock.passes(m) {
+        // Regression guard: the reliable registers must stay tuner-grade.
+        if (RELIABLE.contains(&m) || RELIABLE_TREBLE.contains(&m)) && !r.lock.passes(m) {
             violations.push(format!(
-                "[regress] {} slipped below tuner-grade in the reliable register",
+                "[regress] {} slipped below tuner-grade in a reliable register",
                 key_label(m)
             ));
         }
@@ -229,12 +255,11 @@ fn synthetic_corpus_matches_detection_baseline() {
         }
 
         // Known-limitation keys must still fail: a pass means the detector
-        // improved (e.g. #14 / #15 landed) and the baseline must be promoted.
-        let tracked = KNOWN_FAIL_BASS.contains(&m) || KNOWN_FAIL_TREBLE.contains(&m);
-        if tracked && r.lock.passes(m) {
+        // improved (e.g. #15 landed) and the baseline must be promoted.
+        if KNOWN_FAIL_BASS.contains(&m) && r.lock.passes(m) {
             violations.push(format!(
                 "[promote] {} now locks within tolerance — the accuracy work for its \
-                 register (#14/#15) has progressed; move it into the reliable baseline",
+                 register (#15) has progressed; move it into the reliable baseline",
                 key_label(m)
             ));
         }
@@ -256,6 +281,36 @@ fn synthetic_corpus_matches_detection_baseline() {
         violations.len(),
         violations.join("\n")
     );
+}
+
+/// Issue #14's own bar ("<1 cent") is about how precisely the detector reads
+/// the string, not about how close a stiff string's fundamental sits to a
+/// flat equal-tempered grid — those are different questions, and the corpus
+/// bakes in a real answer to the second one (see [`RELIABLE_TREBLE`]). This
+/// scores the spectral refinement against what `synth_note` actually put in
+/// the fixture — `f0 * sqrt(1 + B)`, the true stretched partial 1 — so it
+/// isolates detector precision from the corpus's own inharmonicity model.
+#[test]
+fn treble_spectral_refinement_locks_the_true_partial_within_one_cent() {
+    const TRUE_PARTIAL_TOLERANCE: f32 = 1.0;
+
+    for midi in RELIABLE_TREBLE {
+        let f0 = fundamental_hz(midi);
+        let b = inharmonicity_b(midi);
+        let true_partial = f0 * (1.0 + b).sqrt();
+
+        let wav = fixtures::synth_wav(midi, SAMPLE_RATE, FIXTURE_SECS);
+        let f_lock = detect_lock_frequency(&wav)
+            .unwrap_or_else(|| panic!("{}: expected a lock, got none", key_label(midi)));
+
+        let cents = 1200.0 * (f_lock / true_partial).log2().abs();
+        assert!(
+            cents < TRUE_PARTIAL_TOLERANCE,
+            "{}: locked {f_lock:.3} Hz, {cents:.3} cents off the true partial \
+             ({true_partial:.3} Hz, f0={f0:.3} Hz, B={b:.5})",
+            key_label(midi)
+        );
+    }
 }
 
 #[test]
