@@ -102,7 +102,7 @@ impl App {
             default_mode: SelectedMode::default(),
             beep_enabled: false,
             beep_pending: false,
-            stretch: Some(StretchCurve::new()),
+            stretch: Some(StretchCurve::railsback_default()),
             save_error: None,
             resume_warning: None,
             audio_warning: None,
@@ -165,19 +165,36 @@ impl App {
         app
     }
 
-    /// Find the profile that produced a Profile-mode session: the most
-    /// recent profile saved at or before the session was created (the
-    /// profile is written immediately before the session starts).
+    /// Find the profile that produced a Profile-mode session.
     fn profile_for_session(session: &Session) -> Option<PianoProfile> {
-        PianoProfile::list_all()
-            .ok()?
-            .into_iter()
-            .find(|p| p.created_at <= session.created_at)
+        let profiles = PianoProfile::list_all().ok()?;
+        Self::find_matching_profile(session, &profiles).cloned()
+    }
+
+    /// Match a session to its profile: prefer the explicit `profile_id` link
+    /// (set on every session since it was introduced); fall back to "the
+    /// most recent profile saved at or before the session was created" for
+    /// sessions saved before the link existed (the profile is written
+    /// immediately before the session starts, so recency alone used to be
+    /// the only signal).
+    ///
+    /// Split out from `profile_for_session` so the matching logic can be
+    /// unit-tested without touching the real user data dir that
+    /// `PianoProfile::list_all` reads from. `profiles` must be sorted
+    /// most-recent-first, as `list_all` returns them.
+    fn find_matching_profile<'a>(
+        session: &Session,
+        profiles: &'a [PianoProfile],
+    ) -> Option<&'a PianoProfile> {
+        match &session.profile_id {
+            Some(profile_id) => profiles.iter().find(|p| &p.id == profile_id),
+            None => profiles.iter().find(|p| p.created_at <= session.created_at),
+        }
     }
 
     /// Enable or disable stretch tuning (Railsback curve).
     pub fn set_stretch(&mut self, enabled: bool) {
-        self.stretch = enabled.then(StretchCurve::new);
+        self.stretch = enabled.then(StretchCurve::railsback_default);
     }
 
     /// Error from the most recent save (session or profile), if any. Also
@@ -438,12 +455,15 @@ impl App {
     /// widget: this state can be reached after profiling, where the widget
     /// no longer reflects the mode actually in progress.
     fn start_tuning(&mut self, mode: TuningMode, tuning_order: TuningOrder) {
-        self.flow = Some(TuningFlow::new(
-            mode,
-            tuning_order,
-            self.temperament,
-            self.stretch.clone(),
-        ));
+        let mut flow = TuningFlow::new(mode, tuning_order, self.temperament, self.stretch.clone());
+        // Profile mode: link the session to the profile that ordered it, so
+        // resuming can't reattach a different piano's profile (see
+        // `find_matching_profile`). `self.profile` is set by
+        // `finish_profiling` before this runs; Quick/Concert leave it None.
+        if let Some(profile) = &self.profile {
+            flow.session_mut().profile_id = Some(profile.id.clone());
+        }
+        self.flow = Some(flow);
         self.state = AppState::Tuning;
         self.setup_current_note();
     }
@@ -926,6 +946,93 @@ mod tests {
         // this resume must not inherit the resumed session's A4
         assert!((app.configured_a4 - 440.0).abs() < f32::EPSILON);
         assert!(app.resume_warning.is_none());
+    }
+
+    #[test]
+    fn test_start_tuning_links_profile_id_when_profile_present() {
+        let mut app = App::with_config(&test_config(440.0));
+        app.mode_select.select(SelectedMode::Profile);
+        let profile = PianoProfile::new();
+        let profile_id = profile.id.clone();
+        app.profile = Some(profile);
+
+        app.start_tuning(TuningMode::Profile, TuningOrder::new());
+
+        let session = app.flow.as_ref().expect("session created").session();
+        assert_eq!(session.profile_id.as_deref(), Some(profile_id.as_str()));
+    }
+
+    #[test]
+    fn test_start_tuning_leaves_profile_id_none_without_profile() {
+        let app = concert_app(); // Concert mode: no profile involved
+        let session = app.flow.as_ref().expect("session created").session();
+        assert!(session.profile_id.is_none());
+    }
+
+    /// Build a minimal profile with a given id/created_at for matching tests.
+    fn test_profile(id: &str, created_at: chrono::DateTime<chrono::Utc>) -> PianoProfile {
+        let mut profile = PianoProfile::new();
+        profile.id = id.to_string();
+        profile.created_at = created_at;
+        profile
+    }
+
+    #[test]
+    fn test_find_matching_profile_prefers_explicit_link_over_recency() {
+        // Regression for #21: profile A, then profile B (more recent), then
+        // resume A's session must reattach A - not silently pick B.
+        let now = chrono::Utc::now();
+        let profile_a = test_profile("profile-a", now - chrono::Duration::minutes(10));
+        let profile_b = test_profile("profile-b", now - chrono::Duration::minutes(1));
+        // list_all() returns most-recent-first.
+        let profiles = vec![profile_b, profile_a];
+
+        let mut session = Session::new(TuningMode::Profile, 440.0);
+        session.created_at = now;
+        session.profile_id = Some("profile-a".to_string());
+
+        let found = App::find_matching_profile(&session, &profiles).expect("profile found");
+        assert_eq!(
+            found.id, "profile-a",
+            "explicit link must win over the more recent profile"
+        );
+    }
+
+    #[test]
+    fn test_find_matching_profile_falls_back_to_recency_heuristic_without_link() {
+        // Legacy sessions (saved before profile_id existed) keep the old
+        // "most recent profile at or before the session" behavior.
+        let now = chrono::Utc::now();
+        let profile_a = test_profile("profile-a", now - chrono::Duration::minutes(10));
+        let profile_b = test_profile("profile-b", now - chrono::Duration::minutes(1));
+        let profiles = vec![profile_b, profile_a];
+
+        let mut session = Session::new(TuningMode::Profile, 440.0);
+        session.created_at = now;
+        session.profile_id = None;
+
+        let found = App::find_matching_profile(&session, &profiles).expect("profile found");
+        assert_eq!(
+            found.id, "profile-b",
+            "legacy sessions use the most-recent-at-or-before heuristic"
+        );
+    }
+
+    #[test]
+    fn test_find_matching_profile_returns_none_when_linked_profile_missing() {
+        // A dangling profile_id (e.g. the profile was deleted) must not
+        // silently fall back to the heuristic and reattach the wrong piano.
+        let now = chrono::Utc::now();
+        let profiles = vec![test_profile(
+            "profile-b",
+            now - chrono::Duration::minutes(1),
+        )];
+
+        let mut session = Session::new(TuningMode::Profile, 440.0);
+        session.created_at = now;
+        session.profile_id = Some("missing-profile".to_string());
+
+        assert!(App::find_matching_profile(&session, &profiles).is_none());
     }
 
     /// Config-driven app in Tuning state on the first note (F3, a bichord),
