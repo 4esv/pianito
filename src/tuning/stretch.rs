@@ -232,8 +232,12 @@ mod tests {
         // StretchCurve::new() (pre-refactor name; now railsback_default()) via
         // f32::to_bits() for exact reproduction (avoids decimal-literal
         // rounding drift).
+        // NOTE: `let`, not `const` - const `f32::from_bits` is only stable
+        // since Rust 1.83, and this crate's MSRV floor is 1.82. Non-const
+        // `f32::from_bits` has been stable since 1.20, so a runtime binding
+        // keeps the exact-bits table while compiling on the declared MSRV.
         #[rustfmt::skip]
-        const EXPECTED: [f32; 88] = [
+        let expected: [f32; 88] = [
             f32::from_bits(3246090155), f32::from_bits(3245256062), f32::from_bits(3244443631), f32::from_bits(3243652866), f32::from_bits(3242883766), f32::from_bits(3242136330), f32::from_bits(3241410560), f32::from_bits(3240706455),
             f32::from_bits(3240024013), f32::from_bits(3239363237), f32::from_bits(3238724127), f32::from_bits(3238106678), f32::from_bits(3237019108), f32::from_bits(3235870871), f32::from_bits(3234765967), f32::from_bits(3233704393),
             f32::from_bits(3232686147), f32::from_bits(3231711232), f32::from_bits(3230779645), f32::from_bits(3229891390), f32::from_bits(3228478846), f32::from_bits(3226875650), f32::from_bits(3225359114), f32::from_bits(3223929239),
@@ -248,7 +252,7 @@ mod tests {
         ];
 
         let curve = StretchCurve::railsback_default();
-        for (i, &expected) in EXPECTED.iter().enumerate() {
+        for (i, &expected) in expected.iter().enumerate() {
             let midi = (i + 21) as u8;
             let actual = curve.offset_cents(midi);
             assert_eq!(
