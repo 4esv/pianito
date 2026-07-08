@@ -223,7 +223,7 @@ mod tests {
             TuningMode::Concert,
             TuningOrder::new(),
             Temperament::with_a4(440.0),
-            Some(StretchCurve::new()),
+            Some(StretchCurve::railsback_default()),
         )
     }
 
