@@ -11,6 +11,7 @@ use crate::tuning::session::{Session, TuningMode};
 use crate::tuning::stretch::StretchCurve;
 use crate::tuning::temperament::Temperament;
 
+use super::components::HelpOverlay;
 use super::screens::{
     mode_select::SelectedMode, CalibrationScreen, CompleteScreen, ModeSelectScreen,
     ProfilingScreen, TuningScreen,
@@ -81,6 +82,9 @@ pub struct App {
     resume_warning: Option<String>,
     /// Most recent audio-stream error reported by the capture backend.
     audio_warning: Option<String>,
+    /// '?' help overlay. Checked before any screen-specific key handling so
+    /// its input never leaks through to the screen underneath.
+    help: HelpOverlay,
 }
 
 impl App {
@@ -106,6 +110,7 @@ impl App {
             save_error: None,
             resume_warning: None,
             audio_warning: None,
+            help: HelpOverlay::new(),
         }
     }
 
@@ -249,8 +254,15 @@ impl App {
         self.tuning.as_ref().map(|t| t.target_freq())
     }
 
-    /// Handle key press event.
+    /// Handle key press event. The help overlay gets first look at every
+    /// key, on every screen: `?` opens it, and while open it swallows
+    /// whatever key closes it, so that key never also acts on the screen
+    /// underneath (e.g. `s` closing the overlay must not also skip a note).
     pub fn handle_key(&mut self, key: KeyCode) {
+        if self.help.handle_key(key) {
+            return;
+        }
+
         match self.state {
             AppState::ModeSelect => self.handle_mode_select_key(key),
             AppState::Calibration => self.handle_calibration_key(key),
@@ -758,6 +770,12 @@ impl App {
                 frame.render_widget(warning, status_area);
             }
         }
+
+        // Help overlay renders last so it sits on top of the screen and the
+        // status line, on any state.
+        if self.help.is_open() {
+            frame.render_widget(&self.help, area);
+        }
     }
 }
 
@@ -1140,6 +1158,63 @@ mod tests {
         let target = app.current_target_freq().unwrap();
         app.update_pitch(sharp(target, 10.0), 0.9);
         assert!(!app.take_beep());
+    }
+
+    #[test]
+    fn test_question_mark_opens_help_overlay_from_tuning() {
+        let mut app = concert_app();
+        assert!(!app.help.is_open());
+
+        app.handle_key(KeyCode::Char('?'));
+        assert!(app.help.is_open());
+    }
+
+    #[test]
+    fn test_key_that_closes_overlay_does_not_leak_to_tuning_screen() {
+        // Regression for #29: while the overlay is open, the keystroke that
+        // dismisses it must not also act on the screen underneath.
+        let mut app = concert_app();
+        let index_before = app.flow.as_ref().unwrap().current_note_index();
+
+        app.handle_key(KeyCode::Char('?'));
+        assert!(app.help.is_open());
+
+        app.handle_key(KeyCode::Char('s')); // would skip the note if it leaked
+        assert!(!app.help.is_open(), "key must close the overlay");
+        assert_eq!(
+            app.flow.as_ref().unwrap().current_note_index(),
+            index_before,
+            "the closing keystroke must not also skip the note"
+        );
+
+        // Overlay is closed now, so 's' works normally again.
+        app.handle_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.flow.as_ref().unwrap().current_note_index(),
+            index_before + 1
+        );
+    }
+
+    #[test]
+    fn test_esc_closes_overlay_without_quitting() {
+        let mut app = concert_app();
+        app.handle_key(KeyCode::Char('?'));
+
+        app.handle_key(KeyCode::Esc);
+        assert!(!app.help.is_open());
+        assert!(!app.should_quit(), "Esc must close the overlay, not quit");
+    }
+
+    #[test]
+    fn test_question_mark_toggles_overlay_from_mode_select() {
+        let mut app = App::new();
+        app.handle_key(KeyCode::Char('?'));
+        assert!(app.help.is_open());
+
+        app.handle_key(KeyCode::Char('?'));
+        assert!(!app.help.is_open());
+        // The mode-select screen never saw either '?' as a key of its own.
+        assert_eq!(app.mode_select.selected(), SelectedMode::QuickTune);
     }
 
     #[test]
