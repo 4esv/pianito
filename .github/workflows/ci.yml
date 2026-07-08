@@ -3,12 +3,56 @@ name: CI
 on: [push, pull_request]
 
 jobs:
-  test:
+  # Canonical fmt/clippy gate. Deliberately NOT matrixed across OS: CI runs
+  # latest stable while local dev lags behind (see repo memory), so a single
+  # job keeps that skew in one place instead of doubling it.
+  lint:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cpal's ALSA backend links against libasound and needs pkg-config to
+      # find it; macOS links CoreAudio directly and needs nothing extra.
+      - name: Install ALSA dev headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
       - run: cargo test --all-features
       - run: cargo build --release
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - run: cargo audit
+
+  # Guards the `rust-version = "1.82"` floor declared in Cargo.toml. Runs on
+  # ubuntu-latest (cheapest runner); needs the same ALSA headers as the Linux
+  # test leg since cpal's build script still runs under `cargo check`.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82
+      - uses: Swatinem/rust-cache@v2
+      - name: Install ALSA dev headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+      - run: cargo check
