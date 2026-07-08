@@ -54,9 +54,23 @@ impl CompletedNote {
     }
 }
 
+/// Current on-disk schema version for [`Session`].
+const SCHEMA_VERSION: u32 = 1;
+
+/// Default for the `version` field when it's absent from the JSON.
+///
+/// Sessions saved before this field existed predate versioning entirely, so
+/// treating them as `1` is correct, not just a filler value.
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
+}
+
 /// A tuning session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// Schema version. See [`default_schema_version`].
+    #[serde(default = "default_schema_version")]
+    pub version: u32,
     /// Unique session ID (ISO 8601 timestamp).
     pub id: String,
     /// Tuning mode.
@@ -73,6 +87,13 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     /// Last update time.
     pub updated_at: DateTime<Utc>,
+    /// ID of the `PianoProfile` this session is tuning against (Profile mode
+    /// only; set in `App::start_tuning`). `None` for Quick/Concert sessions
+    /// and for Profile-mode sessions saved before this field existed -
+    /// `App::profile_for_session` falls back to a created_at heuristic for
+    /// those.
+    #[serde(default)]
+    pub profile_id: Option<String>,
 }
 
 impl Session {
@@ -80,6 +101,7 @@ impl Session {
     pub fn new(mode: TuningMode, a4_reference: f32) -> Self {
         let now = Utc::now();
         Self {
+            version: SCHEMA_VERSION,
             id: now.to_rfc3339(),
             mode,
             a4_reference,
@@ -88,6 +110,7 @@ impl Session {
             completed_notes: Vec::new(),
             created_at: now,
             updated_at: now,
+            profile_id: None,
         }
     }
 
@@ -300,6 +323,13 @@ mod tests {
     }
 
     #[test]
+    fn test_new_session_has_current_schema_version_and_no_profile_link() {
+        let session = create_test_session();
+        assert_eq!(session.version, SCHEMA_VERSION);
+        assert!(session.profile_id.is_none());
+    }
+
+    #[test]
     fn test_quick_tune_session() {
         let session = Session::quick_tune(-15.0);
         assert_eq!(session.mode, TuningMode::Quick);
@@ -376,6 +406,7 @@ mod tests {
         let mut session = create_test_session();
         session.complete_note("F3", 1.5);
         session.complete_note("F#3", -0.5);
+        session.profile_id = Some("some-profile-id".to_string());
 
         let json = serde_json::to_string(&session).expect("Should serialize");
         let restored: Session = serde_json::from_str(&json).expect("Should deserialize");
@@ -385,6 +416,8 @@ mod tests {
         assert_eq!(restored.a4_reference, session.a4_reference);
         assert_eq!(restored.current_note_index, session.current_note_index);
         assert_eq!(restored.completed_notes.len(), 2);
+        assert_eq!(restored.version, session.version);
+        assert_eq!(restored.profile_id, session.profile_id);
     }
 
     #[test]
@@ -470,5 +503,55 @@ mod tests {
         let loaded = Session::load(&path).expect("Should load");
         assert_eq!(loaded.completed_notes[0].midi, 53); // F3
         assert_eq!(loaded.completed_notes[1].midi, 73); // C#5
+    }
+
+    #[test]
+    fn test_load_defaults_version_and_profile_id_for_pre_version_sessions() {
+        let temp_dir = TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("pre_version.json");
+
+        let mut session = create_test_session();
+        session.complete_note("F3", 1.5);
+
+        // Strip `version` and `profile_id` to simulate a session saved
+        // before this schema change (missing keys, not just null).
+        let mut value = serde_json::to_value(&session).expect("Should serialize");
+        let obj = value.as_object_mut().expect("session object");
+        obj.remove("version");
+        obj.remove("profile_id");
+        fs::write(&path, value.to_string()).expect("Should write file");
+
+        let loaded = Session::load(&path).expect("Should load");
+        assert_eq!(
+            loaded.version, 1,
+            "missing version must default to 1 (pre-versioning files ARE v1)"
+        );
+        assert!(loaded.profile_id.is_none());
+    }
+
+    #[test]
+    fn test_load_pre_version_fixture_upgrades_to_v1() {
+        // Hand-written fixture matching the real on-disk shape saved by
+        // pianito before `version`/`profile_id` existed (no
+        // derived-then-stripped value).
+        let temp_dir = TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("fixture.json");
+
+        let fixture = r#"{
+            "id": "2024-01-01T00:00:00+00:00",
+            "mode": "concert",
+            "a4_reference": 440.0,
+            "piano_offset_cents": 0.0,
+            "current_note_index": 3,
+            "completed_notes": [],
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "updated_at": "2024-01-01T00:00:00+00:00"
+        }"#;
+        fs::write(&path, fixture).expect("Should write fixture");
+
+        let loaded = Session::load(&path).expect("pre-version fixture must still load");
+        assert_eq!(loaded.version, 1);
+        assert!(loaded.profile_id.is_none());
+        assert_eq!(loaded.current_note_index, 3);
     }
 }
