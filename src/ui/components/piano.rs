@@ -89,6 +89,9 @@ pub struct Piano {
 
 impl Piano {
     /// Create a piano starting at `start_midi` with `num_keys` keys.
+    ///
+    /// Default colors are threaded from [`Theme`] (not hardcoded) so they
+    /// stay in sync with the rest of the UI and degrade under `NO_COLOR`.
     pub fn new(start_midi: u8, num_keys: usize) -> Self {
         Self {
             start_midi,
@@ -96,8 +99,8 @@ impl Piano {
             highlighted: HashSet::new(),
             deviations: HashMap::new(),
             current: None,
-            on_color: Color::Green,
-            current_color: Color::Cyan,
+            on_color: Theme::resolved(Theme::IN_TUNE),
+            current_color: Theme::resolved(Theme::ACCENT),
             continuing: false,
         }
     }
