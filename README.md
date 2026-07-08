@@ -1,6 +1,6 @@
 # pianito
 
-A terminal-based piano tuning application for macOS with guided coaching.
+A terminal-based piano tuning application for macOS and Linux with guided coaching.
 
 ## Features
 
@@ -18,7 +18,16 @@ A terminal-based piano tuning application for macOS with guided coaching.
 
 ### From Source
 
-Requires Rust 1.82+ and a working microphone.
+Requires Rust 1.82+ and a working microphone. On Linux, also install the
+ALSA development headers and `pkg-config` first (cpal's ALSA backend links
+against `libasound` at build time):
+
+```bash
+# Debian/Ubuntu
+sudo apt install libasound2-dev pkg-config
+```
+
+macOS needs nothing extra - it links CoreAudio directly.
 
 ```bash
 git clone https://github.com/4esv/pianito.git
@@ -92,8 +101,10 @@ pianito reset
 
 ## Configuration
 
-Configuration is read from the pianito config directory
-(`~/Library/Application Support/pianito/config.toml` on macOS):
+Configuration is read from the pianito config directory:
+
+- macOS: `~/Library/Application Support/pianito/config.toml`
+- Linux: `~/.config/pianito/config.toml` (or `$XDG_CONFIG_HOME/pianito/config.toml`)
 
 ```toml
 # Default A4 reference frequency (CLI --a4 overrides)
@@ -129,19 +140,39 @@ default_mode = "concert"
 
 Profile mode measures the whole piano before tuning it. Play all 88 keys
 (A0→C8) one at a time; pianito records each note's deviation in cents. The
-profile is saved under the pianito data directory
-(`~/Library/Application Support/pianito/profiles` on macOS), then tuning
-starts with the order reshuffled: the temperament octave (F3-F4) stays first,
-and the remaining notes follow worst-deviation-first.
+profile is saved under the pianito data directory:
+
+- macOS: `~/Library/Application Support/pianito/profiles`
+- Linux: `~/.local/share/pianito/profiles` (or `$XDG_DATA_HOME/pianito/profiles`)
+
+Then tuning starts with the order reshuffled: the temperament octave (F3-F4)
+stays first, and the remaining notes follow worst-deviation-first.
 
 On the profiling screen: `Space` confirms the current note, `B` goes back,
 `S` skips a note, `Q`/`Esc` quits.
 
 ## Requirements
 
-- macOS (uses CoreAudio via cpal)
 - Working microphone with permissions granted
 - Terminal with Unicode support
+
+| | macOS | Linux |
+|---|---|---|
+| Audio backend | CoreAudio, via cpal - works out of the box | ALSA, via cpal |
+| Build-time deps | none beyond Rust | `libasound2-dev`, `pkg-config` |
+| Runtime deps | none beyond the OS | `libasound2` |
+
+The codebase itself has no `cfg(target_os)` branches and no macOS-specific
+APIs - audio I/O goes through cpal and paths through the `directories` crate,
+so Linux support falls out of the same code, not a separate port. Two
+caveats:
+
+- cpal's ALSA backend `dlopen`s `libasound` at runtime, so statically-linked
+  musl builds aren't supported - use the glibc target.
+- CI currently builds and tests on macOS only
+  (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) - there's no
+  automated Linux job yet, so building from source with the prerequisites
+  above is the way to verify it on Linux today.
 
 ## License
 
