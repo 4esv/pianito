@@ -41,8 +41,14 @@ pub struct PitchDetector {
     max_frequency: f32,
     // NOTE: shares the FFT plumbing in `spectrum::PartialAnalyzer` for the
     // treble spectral refinement pass (issue #14) rather than reimplementing
-    // FFT peak-picking here.
+    // FFT peak-picking here. Kept separate from `partial_analyzer` because it
+    // only ever needs the fundamental (`with_max_partials(1)`), where the bass
+    // path wants partials 2-6.
     partials: PartialAnalyzer,
+    // NOTE: owned (not constructed per call) so the guided bass path (issue
+    // #15) reuses the FFT planner's cached plans across strikes instead of
+    // replanning on every frame.
+    partial_analyzer: PartialAnalyzer,
 }
 
 impl PitchDetector {
@@ -72,6 +78,8 @@ impl PitchDetector {
             // Only the fundamental is needed to refine YIN's candidate; skip
             // searching for overtones the caller never asks for.
             partials: PartialAnalyzer::new(sample_rate).with_max_partials(1),
+            // Issue #15's fit only ever uses partials 2-6.
+            partial_analyzer: PartialAnalyzer::new(sample_rate).with_max_partials(6),
         }
     }
 
@@ -115,6 +123,21 @@ impl PitchDetector {
     /// general detector must reject.
     const TARGET_MIN_CONFIDENCE: f32 = 0.5;
 
+    /// Below this target frequency (C3, equal temperament A4=440), route
+    /// [`detect_for_target`](Self::detect_for_target) through the partial-
+    /// based bass estimator (issue #15) instead of the YIN clamp: A0-B2's
+    /// fundamental is weak or absent, and even the clamped time-domain search
+    /// locks onto the inharmonic composite's quasi-period, which is sharp of
+    /// the true f0 by tens of cents rather than the tuner-grade accuracy the
+    /// rest of the guided range gets.
+    const BASS_PARTIAL_MAX_TARGET_HZ: f32 = 130.813;
+
+    /// Confidence floor for accepting a bass partial-fit estimate. Mirrors
+    /// [`TARGET_MIN_CONFIDENCE`](Self::TARGET_MIN_CONFIDENCE)'s role: reject a
+    /// fit with no real partial structure to match (silence, noise, wrong
+    /// note) rather than report a confidently wrong reading.
+    const BASS_MIN_CONFIDENCE: f32 = 0.5;
+
     /// Register-adaptive analysis window for a target pitch: long for bass
     /// (A0 spans ~11 periods at 400 ms vs ~2.75 at the old fixed 100 ms),
     /// short for treble (sub-second sustain, strike transient decays fast).
@@ -153,6 +176,10 @@ impl PitchDetector {
     ) -> Result<PitchResult, DetectError> {
         if target_hz <= 0.0 {
             return Err(DetectError::NoPitch);
+        }
+
+        if target_hz < Self::BASS_PARTIAL_MAX_TARGET_HZ {
+            return self.detect_bass_via_partials(samples, target_hz);
         }
 
         // Window by register: keep only the most recent slice (freshest audio
@@ -224,6 +251,38 @@ impl PitchDetector {
             frequency,
             confidence,
         })
+    }
+
+    /// Bass branch of [`detect_for_target`](Self::detect_for_target) (issue
+    /// #15): estimate f0 from partials 2-6 via [`PartialAnalyzer`] rather than
+    /// trusting a YIN dip. Unlike the register-tiered [`window_for_target`]
+    /// used by the rest of the guided range, this always uses as much of the
+    /// caller's window as it's given (more samples only sharpen the FFT bins,
+    /// never hurt), trimmed only if the caller somehow hands in more than
+    /// [`MAX_WINDOW`](Self::MAX_WINDOW) worth.
+    fn detect_bass_via_partials(
+        &self,
+        samples: &[f32],
+        target_hz: f32,
+    ) -> Result<PitchResult, DetectError> {
+        if samples.len() < 2 {
+            return Err(DetectError::NoPitch);
+        }
+
+        let want = Self::max_window_samples(self.sample_rate);
+        let window = if samples.len() > want {
+            &samples[samples.len() - want..]
+        } else {
+            samples
+        };
+
+        match self.partial_analyzer.estimate_bass_f0(window, target_hz) {
+            Some(estimate) if estimate.confidence >= Self::BASS_MIN_CONFIDENCE => Ok(PitchResult {
+                frequency: estimate.frequency,
+                confidence: estimate.confidence,
+            }),
+            _ => Err(DetectError::NoPitch),
+        }
     }
 
     /// Detect pitch from audio samples using the YIN algorithm.
@@ -579,6 +638,67 @@ mod tests {
             guided.confidence > 0.6,
             "in-band dip should be confident, got {}",
             guided.confidence
+        );
+    }
+
+    #[test]
+    fn test_detect_for_target_bass_recovers_weak_fundamental_within_tuner_tolerance() {
+        // Issue #15: below C3, `detect_for_target` must route through the
+        // partial-based estimator instead of the sharp-biased YIN clamp. This
+        // is the same signal family as
+        // `test_target_prior_resolves_bass_that_plain_detect_rejects` (a weak
+        // fundamental, sizable inharmonicity) but tightened to the tuner-grade
+        // 5-cent bar rather than "within a semitone" — the naive time-domain
+        // clamp resolves this signal to tens of cents sharp (see the scratch
+        // measurements in the PR description); the partial fit must not.
+        let f0 = 55.0; // A1
+        let b = 0.008;
+        let signal = inharmonic_stack(
+            f0,
+            &[(1.0, 0.1), (2.0, 1.0), (3.0, 0.8), (4.0, 0.6), (5.0, 0.4)],
+            b,
+            0.4,
+        );
+
+        let guided = PitchDetector::new(SAMPLE_RATE)
+            .detect_for_target(&signal, f0)
+            .expect("guided bass detector should resolve the note");
+
+        let cents = 1200.0 * (guided.frequency / f0).log2();
+        assert!(
+            cents.abs() < 5.0,
+            "expected within 5 cents of {f0} Hz, got {} ({cents:+.2}c)",
+            guided.frequency
+        );
+        assert!(
+            guided.confidence > 0.5,
+            "expected a confident partial-match reading, got {}",
+            guided.confidence
+        );
+    }
+
+    #[test]
+    fn test_detect_for_target_bass_tolerates_mistuned_string() {
+        // A string can sit up to +/-100 cents off the guided (equal-
+        // tempered) target; the bass path must still find it there, per
+        // issue #15's stated search band.
+        let true_f0 = 41.2; // E1
+        let signal = inharmonic_stack(
+            true_f0,
+            &[(2.0, 1.0), (3.0, 0.8), (4.0, 0.6), (5.0, 0.4), (6.0, 0.3)],
+            0.006,
+            0.4,
+        );
+        let mistuned_target = true_f0 * 2f32.powf(80.0 / 1200.0);
+
+        let guided = PitchDetector::new(SAMPLE_RATE)
+            .detect_for_target(&signal, mistuned_target)
+            .expect("should resolve within the +/-100 cent search band");
+        let cents = 1200.0 * (guided.frequency / true_f0).log2();
+        assert!(
+            cents.abs() < 10.0,
+            "expected within 10 cents of the true {true_f0} Hz, got {} ({cents:+.2}c)",
+            guided.frequency
         );
     }
 
