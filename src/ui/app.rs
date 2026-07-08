@@ -268,7 +268,7 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 // Skip calibration, use the configured A4 reference
                 self.temperament = Temperament::with_a4(self.configured_a4);
-                self.start_tuning();
+                self.start_tuning(TuningMode::Quick);
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 self.quit();
@@ -327,11 +327,7 @@ impl App {
 
     /// Start a new tuning session based on selected mode.
     fn start_session(&mut self) {
-        let mode = match self.mode_select.selected() {
-            SelectedMode::QuickTune => TuningMode::Quick,
-            SelectedMode::ConcertPitch => TuningMode::Concert,
-            SelectedMode::Profile => TuningMode::Profile,
-        };
+        let mode: TuningMode = self.mode_select.selected().into();
 
         match mode {
             TuningMode::Quick => {
@@ -340,7 +336,7 @@ impl App {
             }
             TuningMode::Concert => {
                 self.temperament = Temperament::with_a4(self.configured_a4);
-                self.start_tuning();
+                self.start_tuning(TuningMode::Concert);
             }
             TuningMode::Profile => {
                 self.start_profiling();
@@ -436,18 +432,15 @@ impl App {
             self.profile = Some(profile);
 
             // Start tuning with the profile-based order
-            self.start_tuning();
+            self.start_tuning(TuningMode::Profile);
         }
     }
 
-    /// Start tuning after calibration.
-    fn start_tuning(&mut self) {
-        let mode = match self.mode_select.selected() {
-            SelectedMode::QuickTune => TuningMode::Quick,
-            SelectedMode::ConcertPitch => TuningMode::Concert,
-            SelectedMode::Profile => TuningMode::Profile,
-        };
-
+    /// Start a tuning session in `mode`. The mode is passed in explicitly
+    /// rather than re-derived from the mode-select widget: this state can
+    /// be reached after profiling, where the widget no longer reflects the
+    /// mode actually in progress.
+    fn start_tuning(&mut self, mode: TuningMode) {
         self.session = Some(Session::new(mode, self.temperament.a4()));
         self.current_note_idx = 0;
         self.state = AppState::Tuning;
@@ -506,7 +499,7 @@ impl App {
                         if let Some(a4) = self.calibration.result() {
                             self.temperament = Temperament::with_a4(a4);
                         }
-                        self.start_tuning();
+                        self.start_tuning(TuningMode::Quick);
                     }
                 }
             }
