@@ -1,11 +1,10 @@
 //! Main application state machine.
 
-use std::collections::HashSet;
-
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, widgets::Paragraph, Frame};
 
 use crate::config::EffectiveConfig;
+use crate::tuning::flow::TuningFlow;
 use crate::tuning::order::TuningOrder;
 use crate::tuning::profile::PianoProfile;
 use crate::tuning::session::{Session, TuningMode};
@@ -37,8 +36,10 @@ pub enum AppState {
 pub struct App {
     /// Current state.
     state: AppState,
-    /// Current session.
-    session: Option<Session>,
+    /// Tuning-session state machine (target note, progress, lock latch);
+    /// `Some` only while a session is active (Tuning, and retained through
+    /// Complete until `reset`).
+    flow: Option<TuningFlow>,
     /// Should quit flag.
     should_quit: bool,
     /// Mode select screen.
@@ -53,12 +54,10 @@ pub struct App {
     tuning: Option<TuningScreen>,
     /// Complete screen (created when session ends).
     complete: Option<CompleteScreen>,
-    /// Tuning order.
-    tuning_order: TuningOrder,
-    /// Temperament calculator.
+    /// Temperament calculator. Drives calibration/profiling target math
+    /// before a session (and its own `TuningFlow`) exists; a copy is
+    /// handed to the flow when the session starts.
     temperament: Temperament,
-    /// Current note index in tuning order.
-    current_note_idx: usize,
     /// Configured A4 reference (from CLI/config file) for new sessions.
     configured_a4: f32,
     /// In-tune tolerance in cents (from CLI/config file).
@@ -71,12 +70,9 @@ pub struct App {
     /// A beep is due; the main loop drains this via `take_beep` (the App
     /// has no audio output of its own).
     beep_pending: bool,
-    /// The current strike already reached the in-tune zone. Re-armed only
-    /// on silence or a note/step change so the beep can't retrigger off
-    /// its own sound picked up by the microphone.
-    in_tune_latched: bool,
     /// Railsback stretch curve applied to targets (None = pure equal
-    /// temperament).
+    /// temperament). Same role as `temperament`: pre-session copy, handed
+    /// to the flow when the session starts.
     stretch: Option<StretchCurve>,
     /// Most recent save failure (session autosave or profile save),
     /// surfaced in the status line.
@@ -92,7 +88,7 @@ impl App {
     pub fn new() -> Self {
         Self {
             state: AppState::ModeSelect,
-            session: None,
+            flow: None,
             should_quit: false,
             mode_select: ModeSelectScreen::new(),
             calibration: CalibrationScreen::new(),
@@ -100,15 +96,12 @@ impl App {
             profile: None,
             tuning: None,
             complete: None,
-            tuning_order: TuningOrder::new(),
             temperament: Temperament::new(),
-            current_note_idx: 0,
             configured_a4: 440.0,
             tolerance: 5.0,
             default_mode: SelectedMode::default(),
             beep_enabled: false,
             beep_pending: false,
-            in_tune_latched: false,
             stretch: Some(StretchCurve::new()),
             save_error: None,
             resume_warning: None,
@@ -140,16 +133,16 @@ impl App {
     /// CLI/config value: it only feeds sessions started later from the menu.
     pub fn with_session(session: Session, config: &EffectiveConfig) -> Self {
         let mut app = Self::with_config(config);
-        app.current_note_idx = session.current_note_index;
         app.temperament = Temperament::with_a4(session.a4_reference);
 
         // Profile sessions were ordered by measured deviation; resuming with
         // the traditional order would drop the user on an unrelated note and
         // re-queue notes already tuned.
+        let mut tuning_order = TuningOrder::new();
         if session.mode == TuningMode::Profile {
             match Self::profile_for_session(&session) {
                 Some(profile) => {
-                    app.tuning_order = TuningOrder::from_profile(&profile);
+                    tuning_order = TuningOrder::from_profile(&profile);
                     app.profile = Some(profile);
                 }
                 None => {
@@ -161,7 +154,12 @@ impl App {
             }
         }
 
-        app.session = Some(session);
+        app.flow = Some(TuningFlow::resume(
+            session,
+            tuning_order,
+            app.temperament,
+            app.stretch.clone(),
+        ));
         app.state = AppState::Tuning;
         app.setup_current_note();
         app
@@ -221,12 +219,12 @@ impl App {
 
     /// Get current session.
     pub fn session(&self) -> Option<&Session> {
-        self.session.as_ref()
+        self.flow.as_ref().map(TuningFlow::session)
     }
 
     /// Get mutable session.
     pub fn session_mut(&mut self) -> Option<&mut Session> {
-        self.session.as_mut()
+        self.flow.as_mut().map(TuningFlow::session_mut)
     }
 
     /// Get target frequency for current note.
@@ -268,7 +266,7 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 // Skip calibration, use the configured A4 reference
                 self.temperament = Temperament::with_a4(self.configured_a4);
-                self.start_tuning(TuningMode::Quick);
+                self.start_tuning(TuningMode::Quick, TuningOrder::new());
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 self.quit();
@@ -336,7 +334,7 @@ impl App {
             }
             TuningMode::Concert => {
                 self.temperament = Temperament::with_a4(self.configured_a4);
-                self.start_tuning(TuningMode::Concert);
+                self.start_tuning(TuningMode::Concert, TuningOrder::new());
             }
             TuningMode::Profile => {
                 self.start_profiling();
@@ -427,63 +425,53 @@ impl App {
                 self.save_error = Some(format!("Failed to save profile: {}", e));
             }
 
-            // Create tuning order based on profile deviations
-            self.tuning_order = TuningOrder::from_profile(&profile);
+            // Tuning order based on profile deviations.
+            let tuning_order = TuningOrder::from_profile(&profile);
             self.profile = Some(profile);
 
-            // Start tuning with the profile-based order
-            self.start_tuning(TuningMode::Profile);
+            self.start_tuning(TuningMode::Profile, tuning_order);
         }
     }
 
-    /// Start a tuning session in `mode`. The mode is passed in explicitly
-    /// rather than re-derived from the mode-select widget: this state can
-    /// be reached after profiling, where the widget no longer reflects the
-    /// mode actually in progress.
-    fn start_tuning(&mut self, mode: TuningMode) {
-        self.session = Some(Session::new(mode, self.temperament.a4()));
-        self.current_note_idx = 0;
+    /// Start a tuning session in `mode` following `tuning_order`. The mode
+    /// is passed in explicitly rather than re-derived from the mode-select
+    /// widget: this state can be reached after profiling, where the widget
+    /// no longer reflects the mode actually in progress.
+    fn start_tuning(&mut self, mode: TuningMode, tuning_order: TuningOrder) {
+        self.flow = Some(TuningFlow::new(
+            mode,
+            tuning_order,
+            self.temperament,
+            self.stretch.clone(),
+        ));
         self.state = AppState::Tuning;
         self.setup_current_note();
     }
 
-    /// Set up the tuning screen for the current note.
+    /// Set up the tuning screen for the current note, or transition to the
+    /// complete screen once the flow has run out of notes.
     fn setup_current_note(&mut self) {
-        // New note, new strike: re-arm the lock beep
-        self.in_tune_latched = false;
+        let is_finished = match &self.flow {
+            Some(flow) => flow.is_finished(),
+            None => return,
+        };
 
-        if self.current_note_idx >= 88 {
+        if is_finished {
             self.finish_session();
             return;
         }
 
-        if let Some(note) = self.tuning_order.note_at(self.current_note_idx) {
-            let target_freq = self.target_for_midi(note.midi);
-
-            // Collect completed chromatic indices from session (midi - 21)
-            let completed_notes: HashSet<usize> = if let Some(session) = &self.session {
-                session
-                    .completed_notes
-                    .iter()
-                    .filter_map(|cn| {
-                        // Look up note by name to get its midi, then convert to chromatic index
-                        crate::tuning::notes::Note::from_name(&cn.note)
-                            .map(|n| (n.midi - 21) as usize)
-                    })
-                    .collect()
-            } else {
-                HashSet::new()
-            };
-
+        let current = self.flow.as_ref().and_then(TuningFlow::current_note);
+        if let Some(current) = current {
             let mut tuning = TuningScreen::new(
-                note.display_name(),
-                self.current_note_idx,
-                88,
-                target_freq,
-                note.strings,
-                note.midi,
+                current.display_name,
+                current.note_index,
+                current.total_notes,
+                current.target_freq,
+                current.string_count,
+                current.midi,
             );
-            tuning.set_completed_notes(completed_notes);
+            tuning.set_completed_notes(current.completed_chromatic_indices);
             tuning.set_tolerance(self.tolerance);
             self.tuning = Some(tuning);
         }
@@ -499,7 +487,7 @@ impl App {
                         if let Some(a4) = self.calibration.result() {
                             self.temperament = Temperament::with_a4(a4);
                         }
-                        self.start_tuning(TuningMode::Quick);
+                        self.start_tuning(TuningMode::Quick, TuningOrder::new());
                     }
                 }
             }
@@ -520,7 +508,10 @@ impl App {
                 if let Some(tuning) = &mut self.tuning {
                     if confidence > 0.6 {
                         let target = tuning.target_freq();
-                        let cents = self.temperament.cents_from_target(freq, target);
+                        let cents = match &self.flow {
+                            Some(flow) => flow.cents_from_target(freq, target),
+                            None => 0.0,
+                        };
                         tuning.update(freq, cents);
 
                         // Lock beep: fire once when the strike first enters
@@ -529,11 +520,12 @@ impl App {
                         // up the beep itself and the retrigger would loop.
                         let is_muting =
                             tuning.tuning_step().map(|s| s.is_muting()).unwrap_or(false);
-                        if !is_muting && cents.abs() <= self.tolerance && !self.in_tune_latched {
-                            self.in_tune_latched = true;
-                            if self.beep_enabled {
-                                self.beep_pending = true;
-                            }
+                        let locked = match &mut self.flow {
+                            Some(flow) => flow.observe_lock(cents, self.tolerance, is_muting),
+                            None => false,
+                        };
+                        if locked && self.beep_enabled {
+                            self.beep_pending = true;
                         }
                     } else {
                         tuning.clear();
@@ -547,7 +539,9 @@ impl App {
     /// Clear pitch detection (silence).
     pub fn clear_pitch(&mut self) {
         // Silence between strikes re-arms the lock beep
-        self.in_tune_latched = false;
+        if let Some(flow) = &mut self.flow {
+            flow.rearm_beep_latch();
+        }
         match self.state {
             AppState::Calibration => {
                 self.calibration.clear();
@@ -568,23 +562,25 @@ impl App {
 
     /// Confirm current note is tuned.
     fn confirm_note(&mut self) {
-        if let Some(tuning) = &mut self.tuning {
-            // For multi-string notes (bichord/trichord), advance through steps
-            if tuning.is_multi_string() && tuning.next_step() {
-                // New step, new strike: re-arm the lock beep
-                self.in_tune_latched = false;
-                return;
-            }
+        let Some(tuning) = &mut self.tuning else {
+            return;
+        };
 
-            // Record completion
-            if let Some(session) = &mut self.session {
-                if let Some(note) = self.tuning_order.note_at(self.current_note_idx) {
-                    session.complete_note(note.display_name(), tuning.cents());
-                }
+        // For multi-string notes (bichord/trichord), advance through steps
+        if tuning.is_multi_string() && tuning.next_step() {
+            // New step, new strike: re-arm the lock beep
+            if let Some(flow) = &mut self.flow {
+                flow.rearm_beep_latch();
             }
-
-            self.advance_to_next_note();
+            return;
         }
+
+        let cents = tuning.cents();
+        let finished = self
+            .flow
+            .as_mut()
+            .map(|flow| flow.confirm_current_note(cents));
+        self.after_note_advance(finished);
     }
 
     /// Go back to previous step or previous note.
@@ -592,26 +588,21 @@ impl App {
         // Try to go to previous step first
         if let Some(tuning) = &mut self.tuning {
             if tuning.prev_step() {
-                self.in_tune_latched = false;
+                if let Some(flow) = &mut self.flow {
+                    flow.rearm_beep_latch();
+                }
                 return;
             }
         }
 
         // Otherwise go to previous note
-        if self.current_note_idx > 0 {
-            self.current_note_idx -= 1;
-
-            // Drop the stale completion record so re-confirming the note
-            // doesn't duplicate it (and doesn't show it as already done)
-            if let Some(session) = &mut self.session {
-                session.current_note_index = self.current_note_idx;
-                if let Some(note) = self.tuning_order.note_at(self.current_note_idx) {
-                    let name = note.display_name();
-                    session.completed_notes.retain(|cn| cn.note != name);
-                }
-            }
+        let went_back = self
+            .flow
+            .as_mut()
+            .map(|flow| flow.go_back_note())
+            .unwrap_or(false);
+        if went_back {
             self.autosave_session();
-
             self.setup_current_note();
 
             // For multi-string notes, go to last step
@@ -625,25 +616,23 @@ impl App {
     fn skip_note(&mut self) {
         // Advance without recording a completion: a skipped note is untuned
         // and must not count as 0.0 cents in progress or history
-        if let Some(session) = &mut self.session {
-            session.skip_note();
-        }
-
-        self.advance_to_next_note();
+        let finished = self.flow.as_mut().map(|flow| flow.skip_current_note());
+        self.after_note_advance(finished);
     }
 
-    /// Advance to the next note.
-    fn advance_to_next_note(&mut self) {
-        self.current_note_idx += 1;
-
-        // Persist progress, including the final advance to 88, so a finished
-        // session is stored complete and --resume doesn't reopen it
-        if let Some(session) = &mut self.session {
-            session.current_note_index = self.current_note_idx;
-        }
+    /// Persist progress after a note advances (confirm or skip) and route
+    /// to the next screen: the tuning screen for the next note, or the
+    /// complete screen once `flow` reports the session finished. No-op if
+    /// there was no active flow to advance.
+    fn after_note_advance(&mut self, finished: Option<bool>) {
+        let Some(finished) = finished else {
+            return;
+        };
+        // Persist progress, including the final advance to 88, so a
+        // finished session is stored complete and --resume doesn't reopen
+        // it.
         self.autosave_session();
-
-        if self.current_note_idx >= 88 {
+        if finished {
             self.finish_session();
         } else {
             self.setup_current_note();
@@ -654,9 +643,9 @@ impl App {
     /// completed state remains inspectable until reset.
     fn finish_session(&mut self) {
         let completed_notes = self
-            .session
+            .flow
             .as_ref()
-            .map(|s| s.completed_notes.clone())
+            .map(|flow| flow.session().completed_notes.clone())
             .unwrap_or_default();
         self.complete = Some(CompleteScreen::new(completed_notes));
         self.state = AppState::Complete;
@@ -670,8 +659,8 @@ impl App {
         if cfg!(test) {
             return;
         }
-        let result = match &self.session {
-            Some(session) => session.save(),
+        let result = match &self.flow {
+            Some(flow) => flow.session().save(),
             None => return,
         };
         match result {
@@ -683,20 +672,17 @@ impl App {
     /// Reset to start a new session.
     fn reset(&mut self) {
         self.state = AppState::ModeSelect;
-        self.session = None;
+        self.flow = None;
         self.profiling = None;
         self.profile = None;
         self.tuning = None;
         self.complete = None;
-        self.current_note_idx = 0;
-        self.tuning_order = TuningOrder::new();
         self.mode_select = ModeSelectScreen::new();
         self.mode_select.select(self.default_mode);
         self.calibration = CalibrationScreen::new();
         self.save_error = None;
         self.resume_warning = None;
         self.beep_pending = false;
-        self.in_tune_latched = false;
         // NOTE: tolerance and beep_enabled are config-scoped and survive
         // reset, like configured_a4.
         // NOTE: audio_warning is deliberately kept across reset — a dead
@@ -787,8 +773,8 @@ mod tests {
 
     /// Confirm through all steps of the current note until it's recorded.
     fn confirm_note_fully(app: &mut App) {
-        let before = app.session.as_ref().unwrap().completed_notes.len();
-        while app.session.as_ref().unwrap().completed_notes.len() == before {
+        let before = app.flow.as_ref().unwrap().session().completed_notes.len();
+        while app.flow.as_ref().unwrap().session().completed_notes.len() == before {
             app.confirm_note();
         }
     }
@@ -811,7 +797,7 @@ mod tests {
         app.start_session();
 
         assert!((app.temperament.a4() - 442.0).abs() < f32::EPSILON);
-        let session = app.session.as_ref().unwrap();
+        let session = app.flow.as_ref().unwrap().session();
         assert!((session.a4_reference - 442.0).abs() < f32::EPSILON);
     }
 
@@ -844,31 +830,39 @@ mod tests {
         let mut app = concert_app();
         app.skip_note();
 
-        let session = app.session.as_ref().unwrap();
+        let flow = app.flow.as_ref().unwrap();
         assert!(
-            session.completed_notes.is_empty(),
+            flow.session().completed_notes.is_empty(),
             "skipped notes must not count as tuned at 0.0 cents"
         );
-        assert_eq!(session.current_note_index, 1);
-        assert_eq!(app.current_note_idx, 1);
+        assert_eq!(flow.session().current_note_index, 1);
+        assert_eq!(flow.current_note_index(), 1);
     }
 
     #[test]
     fn test_go_back_removes_stale_completion() {
         let mut app = concert_app();
         confirm_note_fully(&mut app);
-        assert_eq!(app.session.as_ref().unwrap().completed_notes.len(), 1);
+        assert_eq!(
+            app.flow.as_ref().unwrap().session().completed_notes.len(),
+            1
+        );
 
         app.go_back();
-        assert_eq!(app.current_note_idx, 0);
+        assert_eq!(app.flow.as_ref().unwrap().current_note_index(), 0);
         assert!(
-            app.session.as_ref().unwrap().completed_notes.is_empty(),
+            app.flow
+                .as_ref()
+                .unwrap()
+                .session()
+                .completed_notes
+                .is_empty(),
             "record removed so re-confirming can't duplicate it"
         );
 
         confirm_note_fully(&mut app);
         assert_eq!(
-            app.session.as_ref().unwrap().completed_notes.len(),
+            app.flow.as_ref().unwrap().session().completed_notes.len(),
             1,
             "re-confirm must not create a duplicate entry"
         );
@@ -878,16 +872,19 @@ mod tests {
     fn test_finished_session_is_marked_complete() {
         let mut app = concert_app();
 
-        // Jump to the last note
-        app.current_note_idx = 87;
-        if let Some(session) = app.session.as_mut() {
-            session.current_note_index = 87;
+        // Skip through to the last note (index 87) via the real state
+        // machine rather than poking internals directly.
+        for _ in 0..87 {
+            app.skip_note();
         }
-        app.setup_current_note();
         confirm_note_fully(&mut app);
 
         assert_eq!(app.state(), AppState::Complete);
-        let session = app.session.as_ref().expect("session retained on finish");
+        let session = app
+            .flow
+            .as_ref()
+            .expect("session retained on finish")
+            .session();
         assert_eq!(session.current_note_index, 88);
         assert!(
             session.is_complete(),
@@ -923,7 +920,7 @@ mod tests {
 
         let app = App::with_session(session, &test_config(440.0));
         assert_eq!(app.state(), AppState::Tuning);
-        assert_eq!(app.current_note_idx, 5);
+        assert_eq!(app.flow.as_ref().unwrap().current_note_index(), 5);
         assert!((app.temperament.a4() - 441.0).abs() < f32::EPSILON);
         // configured_a4 stays config-scoped: a new session started after
         // this resume must not inherit the resumed session's A4
