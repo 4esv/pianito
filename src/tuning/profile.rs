@@ -276,6 +276,31 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_deserialize_roundtrip() {
+        // Characterizes the current on-disk shape before schema versioning
+        // is added: id, notes, and created_at must survive a round trip
+        // unchanged.
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.5, 1.0); // A0
+        profile.record_note(69, 442.0, 7.85); // A4
+
+        let json = serde_json::to_string(&profile).expect("Should serialize");
+        let restored: PianoProfile = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(restored.id, profile.id);
+        assert_eq!(restored.created_at, profile.created_at);
+        assert_eq!(restored.notes.len(), profile.notes.len());
+
+        let a0 = restored.notes[0].as_ref().expect("A0 recorded");
+        assert_eq!(a0.midi, 21);
+        assert!((a0.cents - 1.0).abs() < 0.01);
+
+        let a4 = restored.notes[48].as_ref().expect("A4 recorded");
+        assert_eq!(a4.midi, 69);
+        assert!((a4.cents - 7.85).abs() < 0.01);
+    }
+
+    #[test]
     fn test_load_normalizes_note_count() {
         let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
         let path = temp_dir.path().join("truncated.json");
