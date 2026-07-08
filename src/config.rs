@@ -114,7 +114,9 @@ impl Config {
         ProjectDirs::from("", "", "pianito").map(|dirs| dirs.config_dir().join("config.toml"))
     }
 
-    /// Load configuration from ~/.config/pianito/config.toml.
+    /// Load configuration from `config.toml` in the platform config dir (see
+    /// [`Self::config_path`] — XDG on Linux, `Application Support` on macOS,
+    /// `%APPDATA%` on Windows).
     pub fn load() -> Self {
         match Self::config_path() {
             Some(path) => Self::load_from(&path),
