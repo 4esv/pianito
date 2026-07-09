@@ -24,6 +24,8 @@
 //!    partial pairs (2:1 / 4:2 / 6:3), integrated octave-by-octave outward
 //!    from A4.
 
+use std::cmp::Ordering;
+
 use anyhow::{anyhow, Result};
 
 use crate::audio::Partial;
@@ -45,11 +47,19 @@ const MIN_PARTIALS_FOR_FIT: usize = 2;
 const MIN_PARTIALS_AFTER_TRIM: usize = 3;
 
 /// A partial whose measured frequency lands more than this many cents from the
-/// current model is treated as mislocated and dropped before refitting. A
-/// clean partial sits within a couple of cents; a bass partial the `B = 0`
-/// search snapped onto the wrong peak is off by tens to hundreds of cents, so
-/// this threshold separates them cleanly without discarding honest noise.
+/// current model — sharp *or* flat — is treated as mislocated and dropped
+/// before refitting. A clean partial sits within a couple of cents; a bass
+/// partial the `B = 0` search snapped onto the wrong peak (or an octave-error /
+/// cross-talk peak) is off by tens to hundreds of cents, so this threshold
+/// separates them cleanly without discarding honest noise.
 const OUTLIER_CENTS: f32 = 25.0;
+
+/// Highest partial number used to *seed* the robust fit. Low-order partials
+/// have low leverage in the linearized `(n^2, (f_n/n)^2)` fit, so a single
+/// mislocated high partial — however sharp — cannot rotate the seed line. The
+/// seed anchors a trustworthy `(f0, B)` that every partial is then vetted
+/// against, before the final refit sharpens `B` on the clean survivors.
+const SEED_MAX_ORDER: f64 = 3.0;
 
 /// Fewest notes with a usable `B` fit needed to define a per-piano curve.
 /// Below this (a legacy profile with no partials, or one where nothing fit)
@@ -88,20 +98,31 @@ pub struct NoteFit {
 /// linearization `(f_n / n)^2 = f0^2 + (f0^2 * B) * n^2` — an exact algebraic
 /// rearrangement of `f_n = n*f0*sqrt(1+B*n^2)`.
 ///
-/// Two robustness measures guard against the mislocated high-order partials
-/// the bass `B = 0` search can leave in a profile (issue #22):
+/// The fit is robust to the mislocated high-order partials the bass `B = 0`
+/// search can leave in a profile (issue #22) *symmetrically* — a sharp
+/// cross-talk / octave-error peak is handled just like a flat harmonic-grid
+/// snap — in three principled stages, all amplitude-weighted:
 ///
-/// - **Amplitude weighting.** Louder partials (the strong low overtones of a
-///   bass note) dominate the fit over weak, possibly-spurious high peaks.
-/// - **Iterative outlier trimming.** After each fit, the partial that lands
-///   furthest (in cents) from the model is dropped if it exceeds
-///   [`OUTLIER_CENTS`], and the fit is repeated — down to
-///   [`MIN_PARTIALS_AFTER_TRIM`] points.
+/// 1. **Seed from the low-order partials** (`n <= `[`SEED_MAX_ORDER`]). These
+///    anchor `(f0, B)` with low leverage, so no single mislocated *high*
+///    partial can rotate the seed line toward itself.
+/// 2. **Reject against the seed, in either direction.** Any partial landing
+///    more than [`OUTLIER_CENTS`] from the seed prediction — sharp or flat — is
+///    dropped. This is a one-shot Huber-style vet against a trustworthy anchor,
+///    not the old "chase the worst residual" loop that a high-leverage sharp
+///    outlier could invert into trimming the honest low partials.
+/// 3. **Refit on the clean survivors.** The high-order clean partials, where
+///    `B`'s signature is strongest, now sharpen the estimate instead of a
+///    mislocated one corrupting it.
+///
+/// [`MIN_PARTIALS_AFTER_TRIM`] spread is preserved: if rejection would leave too
+/// few points, the closest-fitting partials are kept so `B` stays pinned by
+/// real data.
 ///
 /// Returns `None` when fewer than [`MIN_PARTIALS_FOR_FIT`] usable partials are
 /// present or the fit is degenerate/unphysical.
 pub fn fit_note_inharmonicity(partials: &[Partial]) -> Option<NoteFit> {
-    let mut pts: Vec<(f64, f64, f64)> = partials
+    let pts: Vec<(f64, f64, f64)> = partials
         .iter()
         .filter(|p| p.n >= 1 && p.freq_hz > 0.0 && p.amplitude > 0.0)
         .map(|p| (f64::from(p.n), f64::from(p.freq_hz), f64::from(p.amplitude)))
@@ -111,36 +132,69 @@ pub fn fit_note_inharmonicity(partials: &[Partial]) -> Option<NoteFit> {
         return None;
     }
 
-    loop {
-        let (f0_sq, slope) = weighted_line_fit(&pts)?;
-        if !f0_sq.is_finite() || f0_sq <= 0.0 || !slope.is_finite() {
-            return None;
-        }
-        let f0 = f0_sq.sqrt();
-        let b = (slope / f0_sq).max(0.0);
+    // Stage 1: seed from the lowest-order partials only. Prefer those with
+    // `n <= SEED_MAX_ORDER`; if too few carry that low, fall back to the
+    // lowest-order partials available (never fewer than MIN_PARTIALS_FOR_FIT).
+    let mut ordered = pts.clone();
+    ordered.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    let low_count = ordered
+        .iter()
+        .filter(|&&(n, _, _)| n <= SEED_MAX_ORDER)
+        .count();
+    let seed_count = low_count.clamp(MIN_PARTIALS_FOR_FIT, ordered.len());
+    let (seed_f0, seed_b) = model_from(&ordered[..seed_count])?;
 
-        // Find the partial furthest from the current model, measured in cents.
-        let mut worst_idx = 0usize;
-        let mut worst_cents = 0.0f64;
-        for (k, &(n, freq, _)) in pts.iter().enumerate() {
-            let predicted = n * f0 * (1.0 + b * n * n).sqrt();
-            let cents = (1200.0 * (freq / predicted).log2()).abs();
-            if cents > worst_cents {
-                worst_cents = cents;
-                worst_idx = k;
-            }
-        }
+    // Stage 2: reject every partial more than OUTLIER_CENTS from the seed
+    // prediction, in EITHER direction (the residual is an absolute value).
+    let mut survivors: Vec<(f64, f64, f64)> = pts
+        .iter()
+        .copied()
+        .filter(|&(n, freq, _)| {
+            residual_cents(seed_f0, seed_b, n, freq) <= f64::from(OUTLIER_CENTS)
+        })
+        .collect();
 
-        if worst_cents as f32 > OUTLIER_CENTS && pts.len() > MIN_PARTIALS_AFTER_TRIM {
-            pts.remove(worst_idx);
-            continue;
-        }
-
-        return Some(NoteFit {
-            f0: f0 as f32,
-            b: b as f32,
+    // Keep enough spread that B stays pinned by real data: if rejection left
+    // too few survivors, fall back to the closest-fitting partials up to the
+    // guard floor (these include the survivors).
+    let keep = MIN_PARTIALS_AFTER_TRIM.min(pts.len());
+    if survivors.len() < keep {
+        let mut by_fit = pts.clone();
+        by_fit.sort_by(|&(na, fa, _), &(nb, fb, _)| {
+            residual_cents(seed_f0, seed_b, na, fa)
+                .partial_cmp(&residual_cents(seed_f0, seed_b, nb, fb))
+                .unwrap_or(Ordering::Equal)
         });
+        by_fit.truncate(keep);
+        survivors = by_fit;
     }
+
+    // Stage 3: refit on the clean survivors for the final, sharpened B.
+    let (f0, b) = model_from(&survivors)?;
+    Some(NoteFit {
+        f0: f0 as f32,
+        b: b as f32,
+    })
+}
+
+/// Solve the amplitude-weighted linear model for `(f0, B)`, returning `None`
+/// when the normal equations are singular or the result is unphysical
+/// (`f0^2 <= 0`). `B` is clamped `>= 0` (stiffness only stretches sharp).
+fn model_from(pts: &[(f64, f64, f64)]) -> Option<(f64, f64)> {
+    let (f0_sq, slope) = weighted_line_fit(pts)?;
+    if !f0_sq.is_finite() || f0_sq <= 0.0 || !slope.is_finite() {
+        return None;
+    }
+    let f0 = f0_sq.sqrt();
+    let b = (slope / f0_sq).max(0.0);
+    Some((f0, b))
+}
+
+/// Absolute cents between an observed partial frequency and the stiff-string
+/// model's prediction for partial `n` at `(f0, b)`.
+fn residual_cents(f0: f64, b: f64, n: f64, freq: f64) -> f64 {
+    let predicted = n * f0 * (1.0 + b * n * n).sqrt();
+    (1200.0 * (freq / predicted).log2()).abs()
 }
 
 /// Amplitude-weighted least-squares line fit `y = intercept + slope * x` over
@@ -367,6 +421,57 @@ mod tests {
 
         // Guard the guard: the naive fit over the raw list really is corrupted,
         // so the robustness above is doing work.
+        let pts: Vec<(f64, f64, f64)> = partials
+            .iter()
+            .map(|p| (f64::from(p.n), f64::from(p.freq_hz), f64::from(p.amplitude)))
+            .collect();
+        let (f0_sq, slope) = weighted_line_fit(&pts).expect("naive fit");
+        let naive_b = (slope / f0_sq) as f32;
+        assert!(
+            (naive_b - b).abs() > 1.5e-3,
+            "naive fit B {} should be visibly corrupted (else the test proves nothing)",
+            naive_b
+        );
+    }
+
+    #[test]
+    fn fit_is_robust_to_sharp_mislocated_high_partial() {
+        // A stiff bass string with a modest, well-defined B. One high-order
+        // partial is mislocated ~150 cents SHARP — an octave-error / cross-talk
+        // peak the B=0 harmonic search can latch onto — and it carries real
+        // amplitude. A high-order point has high leverage in the linearized
+        // (n^2, (f_n/n)^2) fit, so a *sharp* outlier rotates the line up,
+        // inflating B and dragging f0; the old trim-the-worst rejection then
+        // blames the honest low partials and trims the wrong points. The robust
+        // fit must reject the sharp outlier symmetrically, not just flat ones.
+        let f0 = 110.0; // A2
+        let b = 0.0008;
+        let mut partials = inharmonic_partials(
+            f0,
+            b,
+            &[(1, 1.0), (2, 0.7), (3, 0.5), (4, 0.4), (5, 0.3), (6, 0.2)],
+        );
+        // Corrupt the highest partial: shove it 150 cents sharp, amplitude ~0.3.
+        // With the old trim-the-worst rejection this rotates the line up, the
+        // honest mid partials (n=3,4,5) then read as the outliers and get
+        // trimmed one by one, and the fit converges on {n=1, n=2, bad n=6} with
+        // B ~= 0.0066 (8x true) and f0 ~11 cents flat.
+        let sharp = 2f32.powf(150.0 / 1200.0);
+        let last = partials.last_mut().expect("stack is non-empty");
+        last.freq_hz *= sharp;
+        last.amplitude = 0.3;
+
+        let fit = fit_note_inharmonicity(&partials).expect("robust fit");
+        assert!(
+            (fit.b - b).abs() < 1.5e-3,
+            "robust B fit {} should stay near true {} despite the sharp outlier",
+            fit.b,
+            b
+        );
+        assert!(cents(fit.f0, f0).abs() < 5.0, "f0 fit {} vs {}", fit.f0, f0);
+
+        // Guard the guard: the naive fit over the raw list really is corrupted
+        // (B rotates high), so the robustness above is doing work.
         let pts: Vec<(f64, f64, f64)> = partials
             .iter()
             .map(|p| (f64::from(p.n), f64::from(p.freq_hz), f64::from(p.amplitude)))
