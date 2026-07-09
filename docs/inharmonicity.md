@@ -167,7 +167,11 @@ Railsback default rather than silently reverting to unstretched ET.
 - O.L. Railsback, "Scale Temperament as Applied to Piano Tuning," *Journal
   of the Acoustical Society of America* 9(3), 274 (1938) - the original
   measurements behind the curve's name.
-- Harold A. Conklin Jr., "Generation of partials due to nonlinear mixing in
-  a stringed instrument," *Journal of the Acoustical Society of America*
-  105(1), 536-545 (1999) - the physics of string stiffness driving
-  inharmonicity.
+- Harvey Fletcher, "Normal vibration frequencies of a stiff piano string,"
+  *Journal of the Acoustical Society of America* 36(1), 203-209 (1964) - the
+  primary reference for stiffness-driven inharmonicity and the source of the
+  `f_k = k * f0 * sqrt(1 + B * k^2)` partial-frequency formula used above.
+- Harold A. Conklin Jr., "Design and tone in the mechanoacoustic piano. Part
+  III: Piano strings and scale design," *Journal of the Acoustical Society of
+  America* 100(3), 1286-1298 (1996) - how string geometry and scale design
+  set `B` across the keyboard.
