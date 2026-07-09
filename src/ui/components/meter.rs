@@ -9,10 +9,20 @@ use crate::ui::theme::{BoxChars, Theme};
 pub struct Meter {
     /// Current cents deviation from target (±500 cents range, logarithmic scale).
     cents: f32,
+    /// Smoothed cents position the needle is actually drawn at (issue #32:
+    /// interpolated across frames instead of snapping to each raw ~10Hz
+    /// reading). Defaults to `cents` so callers that never set it get the
+    /// original snap-to-reading behavior.
+    smoothed_cents: f32,
+    /// Fading trail of recent smoothed positions, oldest first, each paired
+    /// with a fade weight in `(0, 1]` (see [`super::animation::NeedleTrail`]).
+    trail: Vec<(f32, f32)>,
     /// Whether we're currently detecting a pitch.
     detecting: bool,
     /// Tolerance threshold in cents.
     tolerance: f32,
+    /// Whether the in-tune zone is mid lock-flash this frame (issue #32).
+    flashing: bool,
 }
 
 impl Meter {
@@ -20,8 +30,11 @@ impl Meter {
     pub fn new(cents: f32) -> Self {
         Self {
             cents,
+            smoothed_cents: cents,
+            trail: Vec::new(),
             detecting: true,
             tolerance: 5.0,
+            flashing: false,
         }
     }
 
@@ -29,8 +42,11 @@ impl Meter {
     pub fn listening() -> Self {
         Self {
             cents: 0.0,
+            smoothed_cents: 0.0,
+            trail: Vec::new(),
             detecting: false,
             tolerance: 5.0,
+            flashing: false,
         }
     }
 
@@ -43,6 +59,29 @@ impl Meter {
     /// Set whether we're detecting.
     pub fn detecting(mut self, detecting: bool) -> Self {
         self.detecting = detecting;
+        self
+    }
+
+    /// Draw the needle at this smoothed position instead of the raw
+    /// `cents` value (issue #32's needle smoothing).
+    pub fn smoothed(mut self, smoothed_cents: f32) -> Self {
+        self.smoothed_cents = smoothed_cents;
+        self
+    }
+
+    /// Fading trail of recent smoothed positions to draw behind the needle
+    /// (issue #32). Each entry is `(cents, fade_weight)`; see
+    /// [`super::animation::NeedleTrail::trail`].
+    pub fn trail(mut self, trail: impl IntoIterator<Item = (f32, f32)>) -> Self {
+        self.trail = trail.into_iter().collect();
+        self
+    }
+
+    /// Mark the in-tune zone as mid lock-flash this frame (issue #32's
+    /// lock animation): drawn with an inverted pop instead of the normal
+    /// fill.
+    pub fn flashing(mut self, flashing: bool) -> Self {
+        self.flashing = flashing;
         self
     }
 }
@@ -101,6 +140,21 @@ impl Meter {
             return 0.0;
         }
         (cents / tolerance).clamp(-1.0, 1.0) * zone_half_width
+    }
+
+    /// Screen-column offset for `cents`: the linear in-zone curve within
+    /// `tolerance`, or the logarithmic out-of-zone curve beyond it. Used to
+    /// plot each historical trail sample (issue #32) on the same curve the
+    /// live indicator uses, so a given cents value always lands at the same
+    /// column whichever one is asking.
+    fn position_offset(cents: f32, tolerance: f32, max_cents: f32, half_width: f32) -> f32 {
+        if cents.abs() <= tolerance {
+            let zone_half_width = Self::zone_half_width(tolerance, max_cents, half_width);
+            Self::sub_tolerance_offset(cents, tolerance, zone_half_width)
+        } else {
+            let clamped = cents.clamp(-max_cents, max_cents);
+            Self::log_position(clamped, max_cents, half_width, Self::LOG_SCALE_PIVOT_CENTS)
+        }
     }
 }
 
@@ -189,6 +243,39 @@ impl Widget for Meter {
         if self.detecting {
             let style = Theme::style_for_cents(self.cents);
 
+            // Fading needle trail (issue #32): reserve the meter's top row
+            // for it, but only when there's actually trail history to draw
+            // and a spare row to give it - otherwise every row still goes
+            // to the main indicator, unchanged from before this existed.
+            let trail_rows: u16 = if !self.trail.is_empty() && meter_height >= 2 {
+                1
+            } else {
+                0
+            };
+            if trail_rows > 0 {
+                let trail_y = meter_y_start;
+                for &(trail_cents, weight) in &self.trail {
+                    let offset =
+                        Self::position_offset(trail_cents, self.tolerance, max_cents, half_width);
+                    let x = (center_x as f32 + offset)
+                        .round()
+                        .clamp(area.x as f32, (area.x + area.width - 1) as f32)
+                        as u16;
+                    let mut trail_style = Theme::style_for_cents(trail_cents);
+                    if weight < 1.0 {
+                        trail_style = trail_style.add_modifier(Modifier::DIM);
+                    }
+                    buf.set_string(
+                        x,
+                        trail_y,
+                        BoxChars::block_for_fill(weight).to_string(),
+                        trail_style,
+                    );
+                }
+            }
+            let indicator_start = meter_y_start + trail_rows;
+            let indicator_end = meter_y_start + meter_height;
+
             if self.cents.abs() <= self.tolerance {
                 // Within tolerance: zone width is derived from tolerance
                 // (see `zone_half_width`), not a fixed character count, so
@@ -198,18 +285,29 @@ impl Widget for Meter {
                 let start_x = center_x.saturating_sub(half_zone).max(area.x);
                 let end_x = (center_x + half_zone + 1).min(area.x + area.width);
 
-                // Sub-tolerance drift: map cents linearly across the zone so
-                // fine settling is still visible instead of the needle
-                // teleporting to a static, information-free block.
-                let needle_offset =
-                    Self::sub_tolerance_offset(self.cents, self.tolerance, zone_half_width);
+                // Sub-tolerance drift: map the smoothed position (issue
+                // #32) linearly across the zone so fine settling is still
+                // visible instead of the needle teleporting to a static,
+                // information-free block.
+                let needle_offset = Self::sub_tolerance_offset(
+                    self.smoothed_cents,
+                    self.tolerance,
+                    zone_half_width,
+                );
                 let needle_x = (center_x as i32 + needle_offset.round() as i32)
                     .clamp(area.x as i32, area.x as i32 + area.width as i32 - 1)
                     as u16;
                 let needle_style = Theme::accent().add_modifier(Modifier::BOLD);
+                // Lock-flash (issue #32): a brief inverted pop the frame the
+                // reading first settles into the zone, distinguishing "just
+                // locked" from "sitting in tune" without a lasting change.
+                let zone_style = if self.flashing {
+                    style.add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    style
+                };
 
-                for row in 0..meter_height {
-                    let y = meter_y_start + row;
+                for y in indicator_start..indicator_end {
                     for x in start_x..end_x {
                         if x == needle_x {
                             // Brighter cell within the zone: shows exactly
@@ -221,13 +319,14 @@ impl Widget for Meter {
                                 needle_style,
                             );
                         } else {
-                            buf.set_string(x, y, "█", style);
+                            buf.set_string(x, y, "█", zone_style);
                         }
                     }
                 }
             } else {
-                // Outside tolerance: narrow indicator at logarithmic position
-                let clamped_cents = self.cents.clamp(-max_cents, max_cents);
+                // Outside tolerance: narrow indicator at logarithmic
+                // position, tracking the smoothed value (issue #32).
+                let clamped_cents = self.smoothed_cents.clamp(-max_cents, max_cents);
                 let x_offset = Self::log_position(
                     clamped_cents,
                     max_cents,
@@ -237,8 +336,7 @@ impl Widget for Meter {
                 let indicator_x = (center_x as f32 + x_offset) as u16;
 
                 // Narrow indicator (1-2 chars) when out of tune
-                for row in 0..meter_height {
-                    let y = meter_y_start + row;
+                for y in indicator_start..indicator_end {
                     if indicator_x >= area.x && indicator_x < area.x + area.width {
                         buf.set_string(indicator_x, y, "█", style);
                     }
@@ -620,5 +718,130 @@ mod tests {
             BoxChars::THICK_VERTICAL.to_string(),
             "needle must be visible at its sub-tolerance position"
         );
+    }
+
+    // -- needle smoothing, trail, and lock-flash rendering (issue #32) --
+
+    #[test]
+    fn test_smoothed_position_used_instead_of_raw_cents() {
+        // Raw cents (30, out of tolerance) would plot far from center; the
+        // smoothed value (0, mid-interpolation) must be what's drawn.
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        let meter = Meter::new(30.0).tolerance(5.0).smoothed(0.0);
+        meter.render(area, &mut buf);
+
+        let center_x = area.x + area.width / 2;
+        let y = area.y + 2;
+        assert_eq!(
+            buf[(center_x, y)].symbol(),
+            "█",
+            "indicator must track the smoothed position, not the raw reading"
+        );
+    }
+
+    #[test]
+    fn test_default_smoothed_matches_raw_cents_when_unset() {
+        // Backward compatibility: callers that never call `.smoothed()` get
+        // exactly the old snap-to-reading behavior.
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf_default = Buffer::empty(area);
+        let mut buf_explicit = Buffer::empty(area);
+
+        Meter::new(42.0)
+            .tolerance(5.0)
+            .render(area, &mut buf_default);
+        Meter::new(42.0)
+            .tolerance(5.0)
+            .smoothed(42.0)
+            .render(area, &mut buf_explicit);
+
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(
+                    buf_default[(x, y)].symbol(),
+                    buf_explicit[(x, y)].symbol(),
+                    "mismatch at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_trail_does_not_shrink_the_indicator_rows() {
+        // No trail history supplied: every meter row must still go to the
+        // main indicator, exactly like before the trail existed.
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf_no_trail = Buffer::empty(area);
+        let mut buf_baseline = Buffer::empty(area);
+
+        Meter::new(0.0)
+            .tolerance(5.0)
+            .trail([])
+            .render(area, &mut buf_no_trail);
+        Meter::new(0.0)
+            .tolerance(5.0)
+            .render(area, &mut buf_baseline);
+
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert_eq!(buf_no_trail[(x, y)].symbol(), buf_baseline[(x, y)].symbol());
+            }
+        }
+    }
+
+    #[test]
+    fn test_trail_marks_are_drawn_on_the_reserved_row() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        // Two trail samples away from center so they land at distinguishable columns.
+        let meter = Meter::new(0.0)
+            .tolerance(5.0)
+            .trail([(-100.0, 0.5), (100.0, 1.0)]);
+        meter.render(area, &mut buf);
+
+        let trail_y = area.y + 2; // meter_y_start, reserved when trail is non-empty
+        let has_partial_block = (area.x..area.x + area.width).any(|x| {
+            BoxChars::BLOCKS.contains(&buf[(x, trail_y)].symbol().chars().next().unwrap())
+        });
+        assert!(
+            has_partial_block,
+            "expected a trail mark on the reserved row"
+        );
+    }
+
+    #[test]
+    fn test_flashing_applies_reversed_modifier_to_the_zone() {
+        let area = Rect::new(0, 0, 80, 8);
+        let mut buf = Buffer::empty(area);
+        let meter = Meter::new(0.0).tolerance(5.0).flashing(true);
+        meter.render(area, &mut buf);
+
+        let center_x = area.x + area.width / 2;
+        // Just past center (not the needle column itself) to land on a
+        // plain zone-fill cell rather than the needle's own style.
+        let x = center_x + 1;
+        let y = area.y + 2;
+        assert!(
+            buf[(x, y)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "flashing must invert the zone fill"
+        );
+    }
+
+    #[test]
+    fn test_render_smoke_at_small_sizes_does_not_panic() {
+        for (w, h) in [(20, 5), (40, 8), (80, 8), (1, 1), (0, 0)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            Meter::new(3.0)
+                .tolerance(5.0)
+                .smoothed(1.5)
+                .trail([(0.0, 0.3), (1.0, 0.6), (1.5, 1.0)])
+                .flashing(true)
+                .render(area, &mut buf);
+        }
     }
 }

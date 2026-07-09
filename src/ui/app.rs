@@ -296,6 +296,13 @@ impl App {
             self.status.clear(StatusId::SilenceWatchdog);
         }
         self.status.tick(now);
+
+        // Hero tuning screen animation (issue #32): needle smoothing/trail
+        // and the lock-flash state machine advance once per render tick,
+        // independent of whether a new pitch reading arrived this tick.
+        if let Some(tuning) = &mut self.tuning {
+            tuning.advance_animation(now);
+        }
     }
 
     /// Set the sample rate of the active audio input (called once by `main`
