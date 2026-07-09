@@ -2,12 +2,12 @@
 //!
 //! A terminal-based piano tuning application with guided coaching.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
 use pianito::audio::{
-    AudioOutput, AudioSource, MedianFilter, MicCapture, PitchDetector, WavAudioSource,
+    AudioOutput, AudioSource, MicCapture, PitchDetector, PitchUpdate, PitchWorker, WavAudioSource,
 };
 use pianito::config::{Args, Command, Config};
 use pianito::tuning::notes::Note;
@@ -204,10 +204,18 @@ fn reset_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render tick (issue #28): the render loop ticks at this cadence
+/// regardless of how often the pitch worker produces a new result, so it
+/// stays a clean seam for #32's hero-screen animations to build on.
+const FRAME_INTERVAL: Duration = Duration::from_micros(16_667); // ~60fps
+
 /// Run the interactive tuning application.
 fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<()> {
-    // Initialize audio capture
-    let mut mic = match MicCapture::new() {
+    // Initialize audio capture. `mic` is kept alive for the whole function
+    // (it owns the cpal stream); the pitch worker below reads through a
+    // `MicReader` handle instead, since `cpal::Stream` can't move to another
+    // thread (see `MicCapture::reader`).
+    let mic = match MicCapture::new() {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Error: Could not access microphone: {}", e);
@@ -217,7 +225,6 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     };
 
     let sample_rate = mic.sample_rate();
-    let detector = PitchDetector::new(sample_rate);
 
     // Create or resume app
     let mut app = if config.resume {
@@ -270,52 +277,50 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     // Initialize terminal
     let mut terminal = ui::init()?;
 
-    // Main loop. Size the buffer to the largest (bass) analysis window; the
-    // guided detector trims it to the current note's register per frame.
-    let mut audio_buffer = vec![0.0f32; PitchDetector::max_window_samples(sample_rate)];
+    // Mic read + YIN move off this thread (issue #28): `PitchWorker` runs
+    // them on its own dedicated thread and delivers results over a channel,
+    // so this loop's render cadence no longer waits on detection.
+    let worker = PitchWorker::spawn(mic.reader());
 
-    // Reject isolated octave-off / glitch frames before they reach the meter.
-    let mut pitch_filter = MedianFilter::new(MedianFilter::DEFAULT_WINDOW);
+    let result = 'tick: loop {
+        let tick_deadline = Instant::now() + FRAME_INTERVAL;
 
-    let result = loop {
-        // Surface mic stream errors (e.g. device unplugged) in the UI
-        // status line instead of writing to stderr while the terminal is
-        // in raw mode
-        if let Some(err) = mic.take_error() {
-            app.set_audio_warning(format!("Audio input error: {}", err));
-        }
         if let Some(output) = &beep_output {
             if let Some(err) = output.take_error() {
                 app.set_audio_warning(format!("Audio output error: {}", err));
             }
         }
+        // Surface mic stream errors (e.g. device unplugged) in the UI status
+        // line instead of writing to stderr while the terminal is in raw
+        // mode. The worker thread polls the backend; this just relays
+        // whatever it last reported.
+        if let Some(err) = worker.take_audio_warning() {
+            app.set_audio_warning(format!("Audio input error: {}", err));
+        }
 
-        // Read audio and detect pitch. When the app is guiding a specific
-        // note, use the target-aware detector: it picks the register window
-        // and clamps the search to +/-2 semitones. Otherwise (mode select,
-        // calibration, profiling) fall back to the full-range detector.
-        let read = mic.read_samples(&mut audio_buffer);
-        if read > 0 {
-            let slice = &audio_buffer[..read];
-            let detection = match app.current_target_freq() {
-                Some(target) => detector.detect_for_target(slice, target),
-                None => detector.detect(slice),
-            };
-            match detection {
-                Ok(pitch_result) => {
-                    let smoothed = pitch_filter.push(pitch_result.frequency);
-                    app.update_pitch(smoothed, pitch_result.confidence);
-                    // Captures the partial spectrum for the inharmonicity fit
-                    // (issue #22/#23); a no-op outside Profiling.
-                    app.capture_profiling_partials(smoothed, pitch_result.confidence, slice);
-                }
-                Err(_) => {
-                    // Silence/lost detection re-arms the window so the next strike
-                    // starts clean instead of blending across the gap.
-                    pitch_filter.clear();
-                    app.clear_pitch();
-                }
+        // Guided detection needs the current note's target frequency; mode
+        // select/calibration/profiling have none, so the worker falls back
+        // to full-range detection.
+        worker.set_target(app.current_target_freq());
+
+        // Apply the freshest pitch result, if the worker has produced one
+        // since last tick - never blocking, so a slow worker just means the
+        // meter holds its last reading for a frame or two.
+        match worker.latest_update() {
+            Some(PitchUpdate::Detected {
+                frequency,
+                confidence,
+                samples,
+            }) => {
+                app.update_pitch(frequency, confidence);
+                // Captures the partial spectrum for the inharmonicity fit
+                // (issue #22/#23); a no-op outside Profiling.
+                app.capture_profiling_partials(frequency, confidence, &samples);
             }
+            Some(PitchUpdate::Silence) => {
+                app.clear_pitch();
+            }
+            None => {}
         }
 
         // Lock beep: the app requests at most one per strike
@@ -331,23 +336,33 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
         if let Err(e) = terminal.draw(|frame| {
             app.render(frame);
         }) {
-            break Err(e.into());
+            break 'tick Err(e.into());
         }
 
-        // Handle input (non-blocking)
-        match ui::poll_event(Duration::from_millis(50)) {
-            Ok(Some(event)) => {
-                if let Some(key) = ui::is_key_press(&event) {
-                    app.handle_key(key);
-                }
+        // Handle input: drain every event queued this tick (a single-event
+        // poll lagged under key-repeat) without busy-waiting - each
+        // `poll_event` call blocks efficiently on the OS's event mechanism
+        // up to the remaining frame budget, so an idle tick sleeps out the
+        // rest of `FRAME_INTERVAL` instead of spinning.
+        loop {
+            let remaining = tick_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Ok(None) => {}
-            Err(e) => break Err(e.into()),
+            match ui::poll_event(remaining) {
+                Ok(Some(event)) => {
+                    if let Some(key) = ui::is_key_press(&event) {
+                        app.handle_key(key);
+                    }
+                }
+                Ok(None) => break, // timed out: no more events this tick
+                Err(e) => break 'tick Err(e.into()),
+            }
         }
 
         // Check for quit
         if app.should_quit() {
-            break Ok(());
+            break 'tick Ok(());
         }
     };
 
