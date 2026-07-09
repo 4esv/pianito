@@ -134,10 +134,12 @@ impl Widget for &CalibrationScreen {
             let freq_text = format!("{:.1} Hz", freq);
             let deviation_text = format!("({:+.1} Hz from 440)", deviation);
 
-            let freq_x = pitch_area.x + pitch_area.width / 2 - freq_text.len() as u16 / 2;
+            let freq_x =
+                (pitch_area.x + pitch_area.width / 2).saturating_sub(freq_text.len() as u16 / 2);
             buf.set_string(freq_x, pitch_area.y, &freq_text, style);
 
-            let dev_x = pitch_area.x + pitch_area.width / 2 - deviation_text.len() as u16 / 2;
+            let dev_x = (pitch_area.x + pitch_area.width / 2)
+                .saturating_sub(deviation_text.len() as u16 / 2);
             buf.set_string(dev_x, pitch_area.y + 1, &deviation_text, Theme::muted());
         } else {
             let listening_text = if self.listening {
@@ -145,7 +147,8 @@ impl Widget for &CalibrationScreen {
             } else {
                 "No pitch detected"
             };
-            let x = pitch_area.x + pitch_area.width / 2 - listening_text.len() as u16 / 2;
+            let x = (pitch_area.x + pitch_area.width / 2)
+                .saturating_sub(listening_text.len() as u16 / 2);
             buf.set_string(x, pitch_area.y, listening_text, Theme::muted());
         }
 
@@ -155,7 +158,8 @@ impl Widget for &CalibrationScreen {
         let label = format!("Samples: {}/{}", self.samples.len(), self.target_samples);
 
         // Progress label
-        let label_x = progress_area.x + progress_area.width / 2 - label.len() as u16 / 2;
+        let label_x =
+            (progress_area.x + progress_area.width / 2).saturating_sub(label.len() as u16 / 2);
         buf.set_string(label_x, progress_area.y, &label, Theme::muted());
 
         // Progress bar
@@ -183,5 +187,54 @@ impl Widget for &CalibrationScreen {
             .style(Theme::muted())
             .alignment(Alignment::Center);
         help.render(chunks[6], buf);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render_to_string(screen: &CalibrationScreen, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        screen.render(area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // -- centering arithmetic must not underflow (issue #31 item 4) --
+
+    #[test]
+    fn test_render_smoke_across_sizes_does_not_panic() {
+        let mut screen = CalibrationScreen::new();
+        screen.update(440.0);
+
+        for (w, h) in [
+            (0, 0),
+            (1, 1),
+            (10, 5),
+            (29, 10), // just under the width gate
+            (30, 9),  // just under the height gate
+            (30, 10), // exactly at both gates
+            (80, 24),
+            (200, 60),
+        ] {
+            let _ = render_to_string(&screen, w, h);
+        }
+    }
+
+    #[test]
+    fn test_current_pitch_display_survives_at_the_gate_boundary() {
+        // Outer 32x12 -> inner 30x10, exactly at the "too small" gate.
+        let mut screen = CalibrationScreen::new();
+        screen.update(442.3);
+        let rendered = render_to_string(&screen, 32, 12);
+        assert!(rendered.contains("Hz"), "expected the frequency readout");
     }
 }

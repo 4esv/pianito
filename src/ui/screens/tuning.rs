@@ -12,8 +12,212 @@ use ratatui::{
 
 use crate::ui::components::animation::{LockAnimation, NeedleTrail};
 use crate::ui::components::instructions::TuningStep;
+use crate::ui::components::meter::MuteLevel;
 use crate::ui::components::{Instructions, Meter, NoteGlyph, Piano, Progress};
 use crate::ui::theme::{Shortcuts, Theme};
+
+/// Progressive small-terminal degradation for the tuning screen (issue
+/// #31). The full layout wants a lot of vertical real estate (the note
+/// glyph header, the piano, capped instructions, a flexible meter, and
+/// help text); rather than a single "too small" wall, each optional
+/// element is dropped in turn - piano, then the large note glyph, then
+/// instructions, then help - so the essential needle+note+cents stay
+/// visible as long as there's room for a full-featured [`Meter`] (the
+/// [`Meter`] widget itself degrades further below that, see `meter.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuningLayoutPlan {
+    show_piano: bool,
+    show_glyph: bool,
+    show_instructions: bool,
+    show_help: bool,
+}
+
+impl TuningLayoutPlan {
+    /// Row cost of the header when showing the large 5-row note glyph
+    /// beside the progress line.
+    const GLYPH_HEADER_ROWS: u16 = 5;
+    /// Row cost of the header once the glyph is dropped - just the
+    /// progress line's own compact 1-row form.
+    const PLAIN_HEADER_ROWS: u16 = 1;
+    /// Breathing room between the header and the piano, shown only when
+    /// the piano itself is shown (issue #31: the other spacers from the
+    /// original layout are cut entirely to buy back rows for the piano at
+    /// 80x24).
+    const HEADER_SPACER_ROWS: u16 = 1;
+    /// [`Piano`] itself refuses to render below this height.
+    const PIANO_ROWS: u16 = 4;
+    /// Instructions capped at ~4 rows (issue #32 deferred item), instead
+    /// of the `Min(6)` that used to let prose soak up the meter's space.
+    const INSTRUCTIONS_ROWS: u16 = 4;
+    const HELP_ROWS: u16 = 2;
+    /// Rows [`Meter`] needs to show its full tick/needle/cents display;
+    /// below this it falls back to a compact one-liner rather than a
+    /// blank area, so starving it below this floor is a last resort, not
+    /// a first one.
+    const MIN_FULL_METER_ROWS: u16 = 5;
+
+    /// Combinations to try, most generous first. Each is a strict subset
+    /// of the previous one (never re-adds something an earlier, more
+    /// generous combination dropped), which is what makes this a
+    /// monotonic staircase rather than an arbitrary search.
+    const COMBOS: [(bool, bool, bool, bool); 5] = [
+        // (piano, glyph, instructions, help)
+        (true, true, true, true),
+        (false, true, true, true),
+        (false, false, true, true),
+        (false, false, false, true),
+        (false, false, false, false),
+    ];
+
+    /// Decide which optional elements fit in `height` inner rows: the
+    /// most generous combination that still leaves the meter its full
+    /// height, or the leanest combination if none does.
+    fn compute(height: u16) -> Self {
+        for (piano, glyph, instructions, help) in Self::COMBOS {
+            let fixed = Self::fixed_rows(piano, glyph, instructions, help);
+            if height >= fixed.saturating_add(Self::MIN_FULL_METER_ROWS) {
+                return Self {
+                    show_piano: piano,
+                    show_glyph: glyph,
+                    show_instructions: instructions,
+                    show_help: help,
+                };
+            }
+        }
+        let (piano, glyph, instructions, help) = Self::COMBOS[Self::COMBOS.len() - 1];
+        Self {
+            show_piano: piano,
+            show_glyph: glyph,
+            show_instructions: instructions,
+            show_help: help,
+        }
+    }
+
+    /// Total fixed (non-meter) rows this combination costs.
+    fn fixed_rows(piano: bool, glyph: bool, instructions: bool, help: bool) -> u16 {
+        let header = if glyph {
+            Self::GLYPH_HEADER_ROWS
+        } else {
+            Self::PLAIN_HEADER_ROWS
+        };
+        let spacer = if piano { Self::HEADER_SPACER_ROWS } else { 0 };
+        let piano_rows = if piano { Self::PIANO_ROWS } else { 0 };
+        let instructions_rows = if instructions {
+            Self::INSTRUCTIONS_ROWS
+        } else {
+            0
+        };
+        let help_rows = if help { Self::HELP_ROWS } else { 0 };
+        header + spacer + piano_rows + instructions_rows + help_rows
+    }
+}
+
+/// Resolved screen regions for a [`TuningLayoutPlan`], the actual
+/// [`Layout`] split against `inner`. Kept separate from `TuningLayoutPlan`
+/// so the plan's drop-order decision and the constraint resolution (issue
+/// #32's flexible meter height) are each independently testable.
+struct TuningAreas {
+    header: Rect,
+    piano: Option<Rect>,
+    instructions: Option<Rect>,
+    meter: Rect,
+    help: Option<Rect>,
+}
+
+fn layout_areas(inner: Rect, plan: TuningLayoutPlan) -> TuningAreas {
+    let mut constraints = Vec::with_capacity(6);
+    constraints.push(Constraint::Length(if plan.show_glyph {
+        TuningLayoutPlan::GLYPH_HEADER_ROWS
+    } else {
+        TuningLayoutPlan::PLAIN_HEADER_ROWS
+    }));
+    if plan.show_piano {
+        constraints.push(Constraint::Length(TuningLayoutPlan::HEADER_SPACER_ROWS));
+        constraints.push(Constraint::Length(TuningLayoutPlan::PIANO_ROWS));
+    }
+    if plan.show_instructions {
+        constraints.push(Constraint::Length(TuningLayoutPlan::INSTRUCTIONS_ROWS));
+    }
+    // The meter gets whatever's left (issue #32 deferred item): a `Min`
+    // constraint instead of a fixed `Length`, so extra vertical space
+    // flows to it rather than to the instructions prose.
+    constraints.push(Constraint::Min(0));
+    if plan.show_help {
+        constraints.push(Constraint::Length(TuningLayoutPlan::HELP_ROWS));
+    }
+
+    let chunks = Layout::vertical(constraints).split(inner);
+
+    let mut idx = 0;
+    let header = chunks[idx];
+    idx += 1;
+    let piano = if plan.show_piano {
+        idx += 1; // skip the spacer
+        let rect = chunks[idx];
+        idx += 1;
+        Some(rect)
+    } else {
+        None
+    };
+    let instructions = if plan.show_instructions {
+        let rect = chunks[idx];
+        idx += 1;
+        Some(rect)
+    } else {
+        None
+    };
+    let meter = chunks[idx];
+    idx += 1;
+    let help = if plan.show_help {
+        Some(chunks[idx])
+    } else {
+        None
+    };
+
+    TuningAreas {
+        header,
+        piano,
+        instructions,
+        meter,
+        help,
+    }
+}
+
+/// Minimum inner width/height below which nothing coherent fits even the
+/// leanest [`TuningLayoutPlan`] (a [`Progress`] header needs 20 columns to
+/// draw anything at all) - the only remaining hard wall, much smaller than
+/// the old 40x19 one (issue #31).
+const MIN_USABLE_WIDTH: u16 = 20;
+const MIN_USABLE_HEIGHT: u16 = 3;
+
+/// Offset that centers `content` units within `container` units, clamped
+/// to zero rather than underflowing when the content doesn't fit (issue
+/// #31 item 4: no more raw `x + width/2 - len/2` arithmetic).
+fn centered_start(container: u16, content: u16) -> u16 {
+    container.saturating_sub(content) / 2
+}
+
+/// Render a centered "too small" message, with the required and current
+/// dimensions (issue #31 item 3), instead of a bare left-aligned string.
+fn render_too_small_message(inner: Rect, buf: &mut Buffer) {
+    let lines = [
+        "Terminal too small".to_string(),
+        format!(
+            "Need at least {MIN_USABLE_WIDTH}x{MIN_USABLE_HEIGHT}, have {}x{}",
+            inner.width, inner.height
+        ),
+    ];
+
+    let start_y = inner.y + centered_start(inner.height, lines.len() as u16);
+    for (i, line) in lines.iter().enumerate() {
+        let y = start_y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let x = inner.x + centered_start(inner.width, line.len() as u16);
+        buf.set_string(x, y, line, Theme::warning());
+    }
+}
 
 /// Main tuning screen state.
 pub struct TuningScreen {
@@ -55,6 +259,10 @@ pub struct TuningScreen {
     /// derived instead of assuming a fixed frame interval (`None` before
     /// the first tick since this note started).
     last_tick: Option<Instant>,
+    /// Level shown by the muting-step VU indicator (issue #32 deferred
+    /// item), `0.0..=1.0`. Fed from pitch-detection confidence while
+    /// muting - see [`Self::set_mute_level`].
+    mute_level: f32,
 }
 
 impl TuningScreen {
@@ -98,6 +306,7 @@ impl TuningScreen {
             needle_trail: NeedleTrail::new(),
             lock_anim: LockAnimation::new(),
             last_tick: None,
+            mute_level: 0.0,
         }
     }
 
@@ -147,11 +356,33 @@ impl TuningScreen {
     pub fn clear(&mut self) {
         self.detected_freq = None;
         self.cents_deviation = 0.0;
+        self.mute_level = 0.0;
     }
 
     /// Get current cents deviation.
     pub fn cents(&self) -> f32 {
         self.cents_deviation
+    }
+
+    /// Set the level shown by the muting-step VU indicator (issue #32
+    /// deferred item), clamped to `0.0..=1.0`. Only meaningful (i.e.
+    /// rendered) while [`Self::shows_mute_level`] is true.
+    pub fn set_mute_level(&mut self, level: f32) {
+        self.mute_level = level.clamp(0.0, 1.0);
+    }
+
+    /// The muting-step VU indicator's current level.
+    pub fn mute_level(&self) -> f32 {
+        self.mute_level
+    }
+
+    /// Whether the meter area should show the mute-step level/VU indicator
+    /// instead of the normal cents meter: true only during a muting step
+    /// (there is no pitch *target* to plot while damping strings), false
+    /// otherwise - including for monochord notes, which have no steps at
+    /// all.
+    pub fn shows_mute_level(&self) -> bool {
+        self.tuning_step.map(|s| s.is_muting()).unwrap_or(false)
     }
 
     /// Check if this note has multiple strings (bichord or trichord).
@@ -204,67 +435,41 @@ impl Widget for &TuningScreen {
         let inner = block.inner(area);
         block.render(area, buf);
 
-        // Minimum for the reduced layout below (header + instructions +
-        // meter + help)
-        if inner.height < 19 || inner.width < 40 {
-            let msg = "Terminal too small";
-            buf.set_string(inner.x, inner.y, msg, Theme::warning());
+        // The only remaining hard wall (issue #31): below this, nothing
+        // coherent fits even the leanest layout plan. Everything above it
+        // degrades progressively instead - see `TuningLayoutPlan`.
+        if inner.width < MIN_USABLE_WIDTH || inner.height < MIN_USABLE_HEIGHT {
+            render_too_small_message(inner, buf);
             return;
         }
 
-        // Check if we're in muting step (don't show meter or hints)
-        let is_muting_step = self.tuning_step.map(|s| s.is_muting()).unwrap_or(false);
-
-        // Full layout needs 28 rows; below that, drop the piano and spacers
-        // so the meter (the core feedback) keeps its full height.
-        let (header_area, piano_area, instructions_area, meter_area, help_area) =
-            if inner.height >= 28 {
-                let chunks = Layout::vertical([
-                    Constraint::Length(5), // Header: note glyph + progress
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(4), // Piano visualization
-                    Constraint::Length(1), // Spacer
-                    Constraint::Min(6),    // Instructions
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(8), // Meter (hidden during muting)
-                    Constraint::Length(2), // Help text
-                ])
-                .split(inner);
-                (chunks[0], Some(chunks[2]), chunks[4], chunks[6], chunks[7])
-            } else {
-                let chunks = Layout::vertical([
-                    Constraint::Length(5), // Header: note glyph + progress
-                    Constraint::Min(4),    // Instructions
-                    Constraint::Length(8), // Meter (hidden during muting)
-                    Constraint::Length(2), // Help text
-                ])
-                .split(inner);
-                (chunks[0], None, chunks[1], chunks[2], chunks[3])
-            };
+        let plan = TuningLayoutPlan::compute(inner.height);
+        let areas = layout_areas(inner, plan);
 
         // Header: the current note as a large glyph (issue #32 - it used to
         // be the smallest text on screen, the border title) beside the
-        // progress indicator. The glyph is skipped below a width that would
-        // otherwise starve `Progress` (which itself needs >=20 columns).
+        // progress indicator. Dropped first at small heights (`plan`), and
+        // also skipped below a width that would otherwise starve `Progress`
+        // (which itself needs >=20 columns), even when `plan` kept it.
         let glyph_width = NoteGlyph::new(&self.note_name).width();
         let glyph_style = if self.lock_anim.is_locked() {
             Theme::in_tune().add_modifier(Modifier::BOLD)
         } else {
             Theme::accent()
         };
-        let progress_area = if header_area.width >= glyph_width + 2 + 20 {
+        let progress_area = if plan.show_glyph && areas.header.width >= glyph_width + 2 + 20 {
             let chunks = Layout::horizontal([
                 Constraint::Length(glyph_width),
                 Constraint::Length(2), // Gap
                 Constraint::Min(20),
             ])
-            .split(header_area);
+            .split(areas.header);
             NoteGlyph::new(&self.note_name)
                 .style(glyph_style)
                 .render(chunks[0], buf);
             chunks[2]
         } else {
-            header_area
+            areas.header
         };
 
         // Progress indicator
@@ -277,7 +482,7 @@ impl Widget for &TuningScreen {
         progress.render(progress_area, buf);
 
         // Piano visualization (full 88-key piano, A0=MIDI 21)
-        if let Some(piano_area) = piano_area {
+        if let Some(piano_area) = areas.piano {
             let piano = if self.show_piano_progress {
                 Piano::full()
                     .highlighted(self.completed_notes.clone())
@@ -289,25 +494,32 @@ impl Widget for &TuningScreen {
         }
 
         // Instructions panel
-        if let Some(step) = self.tuning_step {
-            // Multi-string note (bichord or trichord)
-            let instructions = if is_muting_step {
-                // Don't show direction hints during muting
-                Instructions::for_step(step, self.string_count)
+        if let Some(instructions_area) = areas.instructions {
+            if let Some(step) = self.tuning_step {
+                // Multi-string note (bichord or trichord)
+                let instructions = if self.shows_mute_level() {
+                    // Don't show direction hints during muting
+                    Instructions::for_step(step, self.string_count)
+                } else {
+                    Instructions::for_step(step, self.string_count)
+                        .with_direction_hint(self.cents_deviation, self.tolerance)
+                };
+                instructions.render(instructions_area, buf);
             } else {
-                Instructions::for_step(step, self.string_count)
-                    .with_direction_hint(self.cents_deviation, self.tolerance)
-            };
-            instructions.render(instructions_area, buf);
-        } else {
-            // Monochord note - simple instruction
-            let instructions =
-                Instructions::simple().with_direction_hint(self.cents_deviation, self.tolerance);
-            instructions.render(instructions_area, buf);
+                // Monochord note - simple instruction
+                let instructions = Instructions::simple()
+                    .with_direction_hint(self.cents_deviation, self.tolerance);
+                instructions.render(instructions_area, buf);
+            }
         }
 
-        // Cents meter (hidden during muting step)
-        if !is_muting_step {
+        // Meter area: the muting-step level/VU indicator (issue #32
+        // deferred item - there's no pitch target to plot while damping
+        // strings, but the area shouldn't just sit blank), or the normal
+        // cents meter otherwise.
+        if self.shows_mute_level() {
+            MuteLevel::new(self.mute_level).render(areas.meter, buf);
+        } else {
             let meter = if self.detected_freq.is_some() {
                 Meter::new(self.cents_deviation)
                     .tolerance(self.tolerance)
@@ -317,22 +529,24 @@ impl Widget for &TuningScreen {
             } else {
                 Meter::listening().tolerance(self.tolerance)
             };
-            meter.render(meter_area, buf);
+            meter.render(areas.meter, buf);
         }
 
         // Help text
-        let help_text = format!(
-            "{} Confirm  {} Back  {} Progress  {} Skip  {} Quit",
-            Shortcuts::SPACE,
-            Shortcuts::BACK,
-            Shortcuts::PIANO,
-            Shortcuts::SKIP,
-            Shortcuts::QUIT
-        );
-        let help = Paragraph::new(help_text)
-            .style(Theme::muted())
-            .alignment(Alignment::Center);
-        help.render(help_area, buf);
+        if let Some(help_area) = areas.help {
+            let help_text = format!(
+                "{} Confirm  {} Back  {} Progress  {} Skip  {} Quit",
+                Shortcuts::SPACE,
+                Shortcuts::BACK,
+                Shortcuts::PIANO,
+                Shortcuts::SKIP,
+                Shortcuts::QUIT
+            );
+            let help = Paragraph::new(help_text)
+                .style(Theme::muted())
+                .alignment(Alignment::Center);
+            help.render(help_area, buf);
+        }
     }
 }
 
@@ -360,15 +574,23 @@ mod tests {
     }
 
     #[test]
-    fn test_small_terminal_keeps_meter_and_help() {
-        // Stock 80x24 terminal: inner is 78x22, below the 28-row full layout
+    fn test_stock_80x24_shows_everything_including_the_piano() {
+        // Issue #31: a stock 80x24 terminal (inner 78x22) used to drop the
+        // piano entirely (the old full layout needed >=28 rows). The
+        // tightened layout (capped instructions, flexible meter, single
+        // header spacer) must now fit piano + glyph + instructions + meter
+        // + help all at once at this size.
         let screen = monochord_screen();
         let rendered = render_to_string(&screen, 80, 24);
 
         assert!(!rendered.contains("Terminal too small"));
         assert!(rendered.contains("Listening..."), "meter must be visible");
         assert!(rendered.contains("Confirm"), "help line must be visible");
-        assert!(!rendered.contains('╚'), "piano dropped at this height");
+        assert!(rendered.contains('╚'), "piano must survive at 80x24");
+        assert!(
+            rendered.contains('█'),
+            "note glyph must also survive at 80x24"
+        );
     }
 
     #[test]
@@ -381,10 +603,44 @@ mod tests {
     }
 
     #[test]
-    fn test_too_small_terminal_shows_message() {
+    fn test_moderately_small_terminal_degrades_instead_of_a_hard_wall() {
+        // Issue #31's flagged regression: 18-20 *inner* rows used to hit
+        // the "too small" wall. This is even smaller (inner ~8 rows) and
+        // must still render real content, not a message.
         let screen = monochord_screen();
         let rendered = render_to_string(&screen, 80, 10);
+
+        assert!(!rendered.contains("Terminal too small"));
+        assert!(
+            rendered.contains("Listening..."),
+            "meter must still be visible when everything else is dropped"
+        );
+    }
+
+    #[test]
+    fn test_extremely_narrow_terminal_still_shows_the_message() {
+        // Inner width 19, just below the 20-column wall; wide enough
+        // overall (21 cols) that the first line isn't clipped.
+        let screen = monochord_screen();
+        let rendered = render_to_string(&screen, 21, 25);
+
         assert!(rendered.contains("Terminal too small"));
+        assert!(
+            rendered.contains("Need at least"),
+            "message should state the required dimensions"
+        );
+    }
+
+    #[test]
+    fn test_too_small_message_reports_current_dimensions() {
+        // Inner height 2, below the 3-row wall; plenty of width so the
+        // message renders without clipping.
+        let screen = monochord_screen();
+        let rendered = render_to_string(&screen, 80, 4);
+        assert!(
+            rendered.contains("78x2"),
+            "expected the actual inner dimensions in the message:\n{rendered}"
+        );
     }
 
     #[test]
@@ -475,14 +731,294 @@ mod tests {
             (0, 0),
             (1, 1),
             (10, 5),
-            (39, 19),  // just under the width gate
-            (40, 18),  // just under the height gate
-            (40, 19),  // exactly at both gates
+            (19, 20), // just under the width gate
+            (20, 2),  // just under the height gate
+            (20, 3),  // exactly at both gates
+            (40, 8),
+            (40, 12),
+            (40, 16),
+            (60, 21),  // just below the full-plan floor
             (78, 22),  // stock 80x24 minus border
-            (108, 28), // full layout threshold
+            (108, 28), // old full layout threshold
             (200, 60),
         ] {
             let _ = render_to_string(&screen, w, h);
         }
+    }
+
+    // -- graceful small-terminal degradation (issue #31) --
+
+    mod layout_plan {
+        use super::*;
+
+        #[test]
+        fn test_generous_height_shows_everything() {
+            let plan = TuningLayoutPlan::compute(40);
+            assert_eq!(
+                plan,
+                TuningLayoutPlan {
+                    show_piano: true,
+                    show_glyph: true,
+                    show_instructions: true,
+                    show_help: true,
+                }
+            );
+        }
+
+        #[test]
+        fn test_stock_80x24_inner_height_keeps_everything() {
+            // 80x24 terminal -> inner height 22 (2 rows for the border).
+            // The whole point of issue #31: the piano must survive here.
+            let plan = TuningLayoutPlan::compute(22);
+            assert!(plan.show_piano, "piano must survive at 80x24");
+            assert!(plan.show_glyph);
+            assert!(plan.show_instructions);
+            assert!(plan.show_help);
+        }
+
+        #[test]
+        fn test_drops_piano_first() {
+            // Enough for glyph+instructions+help+full meter, not for piano too.
+            let plan = TuningLayoutPlan::compute(20);
+            assert!(!plan.show_piano);
+            assert!(plan.show_glyph);
+            assert!(plan.show_instructions);
+            assert!(plan.show_help);
+        }
+
+        #[test]
+        fn test_drops_glyph_next() {
+            let plan = TuningLayoutPlan::compute(15);
+            assert!(!plan.show_piano);
+            assert!(!plan.show_glyph);
+            assert!(plan.show_instructions);
+            assert!(plan.show_help);
+        }
+
+        #[test]
+        fn test_drops_instructions_next() {
+            let plan = TuningLayoutPlan::compute(11);
+            assert!(!plan.show_piano);
+            assert!(!plan.show_glyph);
+            assert!(!plan.show_instructions);
+            assert!(plan.show_help);
+        }
+
+        #[test]
+        fn test_drops_help_last() {
+            let plan = TuningLayoutPlan::compute(7);
+            assert!(!plan.show_piano);
+            assert!(!plan.show_glyph);
+            assert!(!plan.show_instructions);
+            assert!(!plan.show_help);
+        }
+
+        #[test]
+        fn test_leanest_plan_used_below_its_own_floor_without_panicking() {
+            // Height 0: even the leanest combination needs more than this,
+            // but `compute` must still return *something* rather than panic.
+            let plan = TuningLayoutPlan::compute(0);
+            assert_eq!(
+                plan,
+                TuningLayoutPlan {
+                    show_piano: false,
+                    show_glyph: false,
+                    show_instructions: false,
+                    show_help: false,
+                }
+            );
+        }
+
+        #[test]
+        fn test_dropping_is_monotonic_as_height_shrinks() {
+            // Once something is dropped at some height, it must stay dropped
+            // at every smaller height too (no flickering back in).
+            let heights = [40, 22, 21, 20, 19, 16, 15, 12, 11, 8, 7, 6, 3, 0];
+            let mut prev = TuningLayoutPlan::compute(heights[0]);
+            for &h in &heights[1..] {
+                let plan = TuningLayoutPlan::compute(h);
+                assert!(
+                    !plan.show_piano || prev.show_piano,
+                    "piano reappeared at h={h}"
+                );
+                assert!(
+                    !plan.show_glyph || prev.show_glyph,
+                    "glyph reappeared at h={h}"
+                );
+                assert!(
+                    !plan.show_instructions || prev.show_instructions,
+                    "instructions reappeared at h={h}"
+                );
+                assert!(
+                    !plan.show_help || prev.show_help,
+                    "help reappeared at h={h}"
+                );
+                prev = plan;
+            }
+        }
+    }
+
+    mod layout_areas_tests {
+        use super::*;
+
+        #[test]
+        fn test_meter_absorbs_extra_space_beyond_the_fixed_elements() {
+            // Issue #32 deferred item: the meter gets a flexible `Min`
+            // constraint instead of a fixed height, so extra room grows it
+            // rather than the instructions panel.
+            let plan = TuningLayoutPlan {
+                show_piano: false,
+                show_glyph: true,
+                show_instructions: true,
+                show_help: true,
+            };
+            let small = layout_areas(Rect::new(0, 0, 40, 16), plan);
+            let large = layout_areas(Rect::new(0, 0, 40, 26), plan);
+
+            assert_eq!(small.header.height, 5);
+            assert_eq!(small.instructions.unwrap().height, 4);
+            assert_eq!(large.header.height, 5, "header stays fixed");
+            assert_eq!(
+                large.instructions.unwrap().height,
+                4,
+                "instructions stay capped, not absorbing the extra space"
+            );
+            assert!(
+                large.meter.height > small.meter.height,
+                "the meter should grow with the extra space: {} vs {}",
+                large.meter.height,
+                small.meter.height
+            );
+        }
+
+        #[test]
+        fn test_dropped_elements_have_no_area() {
+            let plan = TuningLayoutPlan {
+                show_piano: false,
+                show_glyph: false,
+                show_instructions: false,
+                show_help: false,
+            };
+            let areas = layout_areas(Rect::new(0, 0, 40, 10), plan);
+            assert!(areas.piano.is_none());
+            assert!(areas.instructions.is_none());
+            assert!(areas.help.is_none());
+            assert_eq!(
+                areas.header.height, 1,
+                "plain 1-row header without the glyph"
+            );
+        }
+
+        #[test]
+        fn test_piano_area_gets_its_required_four_rows() {
+            let plan = TuningLayoutPlan {
+                show_piano: true,
+                show_glyph: true,
+                show_instructions: true,
+                show_help: true,
+            };
+            let areas = layout_areas(Rect::new(0, 0, 40, 22), plan);
+            assert_eq!(areas.piano.unwrap().height, 4);
+        }
+    }
+
+    mod too_small_message {
+        use super::*;
+
+        #[test]
+        fn test_centered_start_centers_when_content_fits() {
+            assert_eq!(centered_start(80, 20), 30);
+        }
+
+        #[test]
+        fn test_centered_start_saturates_instead_of_underflowing() {
+            // Content wider than the container must not panic or wrap
+            // around via unsigned underflow.
+            assert_eq!(centered_start(5, 20), 0);
+        }
+
+        #[test]
+        fn test_centered_start_zero_container_does_not_panic() {
+            assert_eq!(centered_start(0, 0), 0);
+        }
+    }
+
+    // -- muting-step level/VU indicator (issue #32 deferred item) --
+
+    fn bichord_screen() -> TuningScreen {
+        // D#2, 2 strings: starts at the MuteBichord step.
+        TuningScreen::new("D#2", 10, 88, 77.8, 2, 39)
+    }
+
+    #[test]
+    fn test_shows_mute_level_true_during_muting_step() {
+        let screen = bichord_screen();
+        assert_eq!(screen.tuning_step(), Some(TuningStep::MuteBichord));
+        assert!(screen.shows_mute_level());
+    }
+
+    #[test]
+    fn test_shows_mute_level_false_once_past_the_muting_step() {
+        let mut screen = bichord_screen();
+        assert!(screen.next_step(), "must advance to TuneBichord");
+        assert_eq!(screen.tuning_step(), Some(TuningStep::TuneBichord));
+        assert!(!screen.shows_mute_level());
+    }
+
+    #[test]
+    fn test_shows_mute_level_false_for_monochord_notes() {
+        let screen = monochord_screen();
+        assert_eq!(screen.tuning_step(), None);
+        assert!(!screen.shows_mute_level());
+    }
+
+    #[test]
+    fn test_mute_level_defaults_to_zero() {
+        let screen = bichord_screen();
+        assert_eq!(screen.mute_level(), 0.0);
+    }
+
+    #[test]
+    fn test_set_mute_level_clamps_to_unit_range() {
+        let mut screen = bichord_screen();
+        screen.set_mute_level(1.5);
+        assert_eq!(screen.mute_level(), 1.0);
+        screen.set_mute_level(-0.5);
+        assert_eq!(screen.mute_level(), 0.0);
+        screen.set_mute_level(0.42);
+        assert_eq!(screen.mute_level(), 0.42);
+    }
+
+    #[test]
+    fn test_clear_resets_mute_level() {
+        let mut screen = bichord_screen();
+        screen.set_mute_level(0.8);
+        screen.clear();
+        assert_eq!(screen.mute_level(), 0.0);
+    }
+
+    #[test]
+    fn test_muting_step_renders_level_indicator_not_a_blank_meter() {
+        let mut screen = bichord_screen();
+        screen.set_mute_level(0.7);
+        let rendered = render_to_string(&screen, 80, 24);
+
+        assert!(
+            !rendered.contains("Listening..."),
+            "the normal meter must not render during a muting step"
+        );
+        assert!(
+            rendered.contains("Muting"),
+            "expected the level indicator's label in the meter area, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn test_tune_step_renders_normal_meter_not_the_level_indicator() {
+        let mut screen = bichord_screen();
+        screen.next_step(); // TuneBichord: no longer muting
+        let rendered = render_to_string(&screen, 80, 24);
+
+        assert!(rendered.contains("Listening..."), "normal meter expected");
     }
 }
