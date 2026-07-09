@@ -151,6 +151,11 @@ stays first, and the remaining notes follow worst-deviation-first.
 On the profiling screen: `Space` confirms the current note, `B` goes back,
 `S` skips a note, `Q`/`Esc` quits.
 
+Profiling also records each note's partial spectrum, which pianito fits
+into a per-piano inharmonicity curve for stretch tuning - see
+[`docs/inharmonicity.md`](docs/inharmonicity.md) for why that stretch is
+necessary and how it's measured.
+
 ## Requirements
 
 - Working microphone with permissions granted
