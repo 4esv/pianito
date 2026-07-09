@@ -283,7 +283,8 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     let worker = PitchWorker::spawn(mic.reader());
 
     let result = 'tick: loop {
-        let tick_deadline = Instant::now() + FRAME_INTERVAL;
+        let now = Instant::now();
+        let tick_deadline = now + FRAME_INTERVAL;
 
         if let Some(output) = &beep_output {
             if let Some(err) = output.take_error() {
@@ -322,6 +323,16 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
             }
             None => {}
         }
+
+        // Feed the silence watchdog (issue #34) from the worker's latest
+        // read signal state - true whenever the stream is alive (even a
+        // quiet room's noise floor), false only for a dead but error-free
+        // input delivering exact-zero frames. Then advance time-driven UI
+        // state (watchdog hint + status-queue expiry/rotation) so both
+        // progress every frame, regardless of whether a pitch arrived this
+        // tick.
+        app.observe_audio_signal(worker.has_signal(), now);
+        app.tick(now);
 
         // Lock beep: the app requests at most one per strike
         if app.take_beep() {
