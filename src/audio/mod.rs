@@ -6,10 +6,12 @@ pub mod reference;
 pub mod smoothing;
 pub mod spectrum;
 pub mod traits;
+pub mod worker;
 
-pub use capture::{AudioOutput, CaptureError, MicCapture};
+pub use capture::{AudioOutput, CaptureError, MicCapture, MicReader};
 pub use pitch::{DetectError, PitchDetector, PitchResult};
 pub use reference::ReferenceTone;
 pub use smoothing::MedianFilter;
 pub use spectrum::{Partial, PartialAnalyzer};
 pub use traits::{AudioSink, AudioSource, TestAudioSink, TestAudioSource, WavAudioSource};
+pub use worker::{PitchUpdate, PitchWorker};

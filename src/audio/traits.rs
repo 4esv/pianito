@@ -9,6 +9,15 @@ pub trait AudioSource {
 
     /// Get the sample rate in Hz.
     fn sample_rate(&self) -> u32;
+
+    /// Take a pending stream error, if this backend reports one
+    /// out-of-band (e.g. `MicReader`, whose cpal error callback runs on
+    /// cpal's own thread rather than the caller's). Default no-op keeps
+    /// the trait's other implementors (test doubles, file-backed sources)
+    /// trivial.
+    fn take_stream_error(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Audio output sink trait.
