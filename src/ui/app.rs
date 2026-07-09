@@ -1070,21 +1070,66 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_mode_uses_measured_curve_once_profile_is_loaded() {
+    fn test_profile_mode_uses_fitted_curve_once_profile_is_loaded() {
         let config = EffectiveConfig {
             stretch: StretchMode::Profile,
             ..test_config(440.0)
         };
         let mut app = App::with_config(&config);
 
+        // A profile carrying partials across the keyboard yields the fitted
+        // per-piano inharmonicity curve (issue #23).
         let mut profile = PianoProfile::new();
-        profile.record_note(21, 27.0, -12.5); // A0, measured 12.5 cents flat
+        for i in 0..88u8 {
+            let midi = i + 21;
+            let bass = ((69.0 - midi as f32) / 48.0).max(0.0);
+            let treble = ((midi as f32 - 69.0) / 39.0).max(0.0);
+            let b = 0.0002 + 0.0006 * bass * bass + 0.0006 * treble * treble;
+            let f0 = 440.0 * 2f32.powf((midi as f32 - 69.0) / 12.0);
+            let partials: Vec<crate::audio::Partial> = (1..=6u16)
+                .map(|n| {
+                    let nf = n as f32;
+                    crate::audio::Partial {
+                        n,
+                        freq_hz: nf * f0 * (1.0 + b * nf * nf).sqrt(),
+                        amplitude: 1.0 / nf,
+                    }
+                })
+                .collect();
+            profile.record_note_with_partials(midi, f0, 0.0, partials);
+        }
         app.profile = Some(profile);
         app.recompute_stretch();
 
-        assert_eq!(app.stretch.as_ref().unwrap().offset_cents(21), -12.5);
-        // A key the profile never measured stays at 0, not the Railsback value.
-        assert_eq!(app.stretch.as_ref().unwrap().offset_cents(108), 0.0);
+        let stretch = app.stretch.as_ref().unwrap();
+        assert!(stretch.offset_cents(21) < 0.0, "A0 fitted flat");
+        assert!(stretch.offset_cents(108) > 0.0, "C8 fitted sharp");
+        // The fitted curve, not the Railsback fallback.
+        assert_ne!(
+            stretch.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_profile_mode_without_partials_falls_back_to_railsback() {
+        let config = EffectiveConfig {
+            stretch: StretchMode::Profile,
+            ..test_config(440.0)
+        };
+        let mut app = App::with_config(&config);
+
+        // A legacy profile (no partials) can't be fit; Profile mode resolves
+        // to the Railsback default rather than a flat/zero curve.
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -12.5);
+        app.profile = Some(profile);
+        app.recompute_stretch();
+
+        assert_eq!(
+            app.stretch.as_ref().unwrap().offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
     }
 
     #[test]
