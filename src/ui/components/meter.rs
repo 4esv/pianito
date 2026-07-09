@@ -161,7 +161,19 @@ impl Meter {
 impl Widget for Meter {
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height < 5 || area.width < 20 {
-            return; // Not enough space
+            // Issue #31: there isn't room for the full tick/needle/cents
+            // display, but a compact single-row meter still fits in most
+            // of these cases - fall back to that instead of leaving the
+            // area blank. Only truly tiny areas (no room for even one
+            // usable row, or fewer than the compact meter's own 10-column
+            // floor) stay blank.
+            if area.height >= 1 && area.width >= 10 {
+                CompactMeter::new(self.smoothed_cents, area.width)
+                    .tolerance(self.tolerance)
+                    .detecting(self.detecting)
+                    .render(area, buf);
+            }
+            return;
         }
 
         let center_x = area.x + area.width / 2;
@@ -376,18 +388,41 @@ impl Widget for Meter {
 pub struct CompactMeter {
     cents: f32,
     width: u16,
+    tolerance: f32,
+    detecting: bool,
 }
 
 impl CompactMeter {
     /// Create a compact meter.
     pub fn new(cents: f32, width: u16) -> Self {
-        Self { cents, width }
+        Self {
+            cents,
+            width,
+            tolerance: 5.0,
+            detecting: true,
+        }
+    }
+
+    /// Set the tolerance threshold (issue #31: so the fallback used by
+    /// [`Meter`] agrees with the configured tolerance instead of a
+    /// hardcoded 5 cents).
+    pub fn tolerance(mut self, tolerance: f32) -> Self {
+        self.tolerance = tolerance;
+        self
+    }
+
+    /// Set whether we're detecting a pitch. When `false`, only the track
+    /// is drawn (no indicator dot), matching the full [`Meter`]'s
+    /// "listening" state.
+    pub fn detecting(mut self, detecting: bool) -> Self {
+        self.detecting = detecting;
+        self
     }
 }
 
 impl Widget for CompactMeter {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 10 {
+        if area.width < 10 || area.height < 1 {
             return;
         }
 
@@ -395,7 +430,6 @@ impl Widget for CompactMeter {
         let center = area.x + width / 2;
         let half_width = (width / 2) as f32;
         let max_cents = 500.0;
-        let tolerance = 5.0;
 
         // Draw background track
         for x in area.x..area.x + width {
@@ -403,14 +437,79 @@ impl Widget for CompactMeter {
             buf.set_string(x, area.y, char.to_string(), Theme::muted());
         }
 
+        if !self.detecting {
+            return;
+        }
+
         // Draw indicator using logarithmic scale
         let style = Theme::style_for_cents(self.cents);
         let clamped = self.cents.clamp(-max_cents, max_cents);
-        let offset = Meter::log_position(clamped, max_cents, half_width, tolerance);
+        let offset = Meter::log_position(clamped, max_cents, half_width, self.tolerance);
         let indicator_x = (center as f32 + offset) as u16;
 
         if indicator_x >= area.x && indicator_x < area.x + width {
             buf.set_string(indicator_x, area.y, "●", style);
+        }
+    }
+}
+
+/// Level/VU indicator shown in the meter area during muting steps (issue
+/// #32's deferred item). While damping outer/adjacent strings there is no
+/// pitch *target* to plot against, so the normal cents meter has nothing
+/// to draw - but the meter region used to just sit blank for the whole
+/// step ("dead hole"). This draws a simple horizontal level bar instead,
+/// scaled by `level` (0.0..=1.0).
+///
+/// `level` is fed from pitch-detection confidence while muting (see
+/// `App::update_pitch`), so it's a coarse "is something still ringing"
+/// signal rather than a calibrated loudness (RMS/dB) meter.
+// TODO: wire true signal amplitude through once the audio pipeline
+// exposes it, instead of reusing detection confidence as a proxy.
+pub struct MuteLevel {
+    level: f32,
+}
+
+impl MuteLevel {
+    /// Create a level indicator, clamping `level` to `0.0..=1.0`.
+    pub fn new(level: f32) -> Self {
+        Self {
+            level: level.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Number of filled bar columns out of `width` for `level`
+    /// (`0.0..=1.0`). Pure so the fill math is unit-testable without a
+    /// buffer.
+    pub fn filled_columns(level: f32, width: u16) -> u16 {
+        (level.clamp(0.0, 1.0) * width as f32).round() as u16
+    }
+}
+
+impl Widget for MuteLevel {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+
+        let bar_y = area.y + area.height / 2;
+        let filled = Self::filled_columns(self.level, area.width);
+        for i in 0..area.width {
+            let x = area.x + i;
+            let (ch, style) = if i < filled {
+                ('█', Theme::accent())
+            } else {
+                ('░', Theme::muted())
+            };
+            buf.set_string(x, bar_y, ch.to_string(), style);
+        }
+
+        // Label only when there's a spare row above the bar - otherwise it
+        // would overwrite the bar itself.
+        if area.height >= 3 {
+            let label = "Muting - listening for ring...";
+            let label_y = bar_y - 1;
+            let x = area.x + (area.width.saturating_sub(label.len() as u16)) / 2;
+            buf.set_string(x, label_y, label, Theme::muted());
         }
     }
 }
@@ -842,6 +941,133 @@ mod tests {
                 .trail([(0.0, 0.3), (1.0, 0.6), (1.5, 1.0)])
                 .flashing(true)
                 .render(area, &mut buf);
+        }
+    }
+
+    // -- compact-meter fallback: no blank hole below the full meter's
+    // 5-row/20-col floor (issue #31) --
+
+    fn row_has_ink(area: Rect, buf: &Buffer, y: u16) -> bool {
+        (area.x..area.x + area.width).any(|x| buf[(x, y)].symbol() != " ")
+    }
+
+    #[test]
+    fn test_meter_falls_back_to_compact_when_too_short() {
+        // Width is plenty (30 cols) but only 3 rows - below the full
+        // meter's 5-row floor.
+        let area = Rect::new(0, 0, 30, 3);
+        let mut buf = Buffer::empty(area);
+        Meter::new(0.0).tolerance(5.0).render(area, &mut buf);
+
+        assert!(
+            row_has_ink(area, &buf, area.y),
+            "expected a compact-meter fallback instead of a blank area"
+        );
+    }
+
+    #[test]
+    fn test_meter_falls_back_to_compact_when_too_narrow() {
+        // Height is plenty (8 rows) but only 15 columns - below the full
+        // meter's 20-column floor, above the compact meter's 10-column one.
+        let area = Rect::new(0, 0, 15, 8);
+        let mut buf = Buffer::empty(area);
+        Meter::new(0.0).tolerance(5.0).render(area, &mut buf);
+
+        assert!(
+            row_has_ink(area, &buf, area.y),
+            "expected a compact-meter fallback instead of a blank area"
+        );
+    }
+
+    #[test]
+    fn test_meter_fallback_stays_blank_below_compact_floor_too() {
+        // Neither the full meter (needs 20 cols) nor the compact one
+        // (needs 10) fit - nothing should be drawn, but it must not panic.
+        let area = Rect::new(0, 0, 5, 3);
+        let mut buf = Buffer::empty(area);
+        Meter::new(0.0).tolerance(5.0).render(area, &mut buf);
+
+        assert!(!row_has_ink(area, &buf, area.y));
+    }
+
+    #[test]
+    fn test_meter_fallback_omits_indicator_while_listening() {
+        let area = Rect::new(0, 0, 30, 3);
+        let mut buf = Buffer::empty(area);
+        Meter::listening().tolerance(5.0).render(area, &mut buf);
+
+        let has_dot = (area.x..area.x + area.width).any(|x| buf[(x, area.y)].symbol() == "●");
+        assert!(!has_dot, "no reading yet - no indicator dot expected");
+        assert!(
+            row_has_ink(area, &buf, area.y),
+            "the track itself should still be visible, not a blank hole"
+        );
+    }
+
+    #[test]
+    fn test_compact_meter_tolerance_builder() {
+        let meter = CompactMeter::new(8.0, 40).tolerance(10.0);
+        assert_eq!(meter.tolerance, 10.0);
+    }
+
+    #[test]
+    fn test_compact_meter_detecting_false_omits_dot() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buf = Buffer::empty(area);
+        CompactMeter::new(50.0, 40)
+            .detecting(false)
+            .render(area, &mut buf);
+
+        let has_dot = (area.x..area.x + area.width).any(|x| buf[(x, area.y)].symbol() == "●");
+        assert!(!has_dot);
+    }
+
+    // -- muting-step level/VU indicator (issue #32 deferred item) --
+
+    #[test]
+    fn test_mute_level_filled_columns_at_zero() {
+        assert_eq!(MuteLevel::filled_columns(0.0, 40), 0);
+    }
+
+    #[test]
+    fn test_mute_level_filled_columns_at_full() {
+        assert_eq!(MuteLevel::filled_columns(1.0, 40), 40);
+    }
+
+    #[test]
+    fn test_mute_level_filled_columns_scales_with_level() {
+        let half = MuteLevel::filled_columns(0.5, 40);
+        assert!(
+            (18..=22).contains(&half),
+            "half level should fill roughly half the width, got {half}"
+        );
+    }
+
+    #[test]
+    fn test_mute_level_clamps_out_of_range_input() {
+        assert_eq!(MuteLevel::filled_columns(-1.0, 40), 0);
+        assert_eq!(MuteLevel::filled_columns(2.0, 40), 40);
+    }
+
+    #[test]
+    fn test_mute_level_render_draws_a_bar_not_a_blank_hole() {
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        MuteLevel::new(0.6).render(area, &mut buf);
+
+        let bar_y = area.y + area.height / 2;
+        assert!(
+            row_has_ink(area, &buf, bar_y),
+            "expected the level bar to draw something, not leave a dead hole"
+        );
+    }
+
+    #[test]
+    fn test_mute_level_render_smoke_at_small_sizes_does_not_panic() {
+        for (w, h) in [(0, 0), (1, 1), (5, 1), (5, 2), (40, 1), (40, 8)] {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            MuteLevel::new(0.5).render(area, &mut buf);
         }
     }
 }
