@@ -120,6 +120,15 @@ pub struct PitchWorker {
     warnings: Receiver<String>,
     target_tx: Sender<Option<f32>>,
     running: Arc<AtomicBool>,
+    /// Whether the most recent mic read carried real signal (issue #34):
+    /// distinct from "a pitch was detected". The silence watchdog samples
+    /// this each render tick to tell a live-but-quiet mic (a nonzero noise
+    /// floor keeps this `true`) apart from a dead-but-error-free stream that
+    /// delivers exact-zero frames (a macOS TCC denial). Kept orthogonal to
+    /// the `PitchUpdate` stream so the once-per-gap `Silence` debounce is
+    /// preserved untouched - `Silence` fires once and can't feed a
+    /// continuous watchdog without false-positiving a resting mic.
+    signal: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -136,6 +145,11 @@ impl PitchWorker {
         let (target_tx, target_rx) = mpsc::channel::<Option<f32>>();
         let running = Arc::new(AtomicBool::new(true));
         let running_thread = Arc::clone(&running);
+        // Starts `false`: before the first read there is no evidence of a
+        // live stream. `App`'s watchdog is anchored at construction, so this
+        // can't trigger a spurious hint inside the timeout window.
+        let signal = Arc::new(AtomicBool::new(false));
+        let signal_thread = Arc::clone(&signal);
 
         let handle = thread::spawn(move || {
             let detector = PitchDetector::new(sample_rate);
@@ -158,11 +172,20 @@ impl PitchWorker {
 
                 let read = source.read_samples(&mut audio_buffer);
                 if read == 0 {
+                    // No new audio this poll: leave `signal` holding its last
+                    // value rather than reporting a false gap (a dead stream
+                    // still delivers zero-valued frames, so it lands in the
+                    // branch below with `has_signal == false`, not here).
                     thread::sleep(IDLE_POLL_INTERVAL);
                     continue;
                 }
 
                 let slice = &audio_buffer[..read];
+                // Report whether this read carried real signal, for the
+                // render loop's silence watchdog (issue #34). Separate from
+                // detection below: signal can be present with no confident
+                // pitch (a struck note's noisy attack, a quiet room's floor).
+                signal_thread.store(super::watchdog::has_signal(slice), Ordering::Relaxed);
                 let detection = match target {
                     Some(t) => detector.detect_for_target(slice, t),
                     None => detector.detect(slice),
@@ -194,6 +217,7 @@ impl PitchWorker {
             warnings,
             target_tx,
             running,
+            signal,
             handle: Some(handle),
         }
     }
@@ -214,6 +238,14 @@ impl PitchWorker {
     /// any (e.g. the microphone was unplugged mid-session).
     pub fn take_audio_warning(&self) -> Option<String> {
         latest(&self.warnings)
+    }
+
+    /// Whether the worker's most recent mic read carried real signal (issue
+    /// #34). Sampled once per render tick to feed `App`'s silence watchdog;
+    /// returns `false` before the first read and while the stream delivers
+    /// only exact-zero frames (a dead but error-free input).
+    pub fn has_signal(&self) -> bool {
+        self.signal.load(Ordering::Relaxed)
     }
 }
 
