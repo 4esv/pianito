@@ -144,6 +144,19 @@ fn copy_latest(samples: &VecDeque<f32>, buffer: &mut [f32]) -> usize {
     copy_from(samples, start, buffer)
 }
 
+/// Shared `read_samples` body for both [`MicCapture`] and [`MicReader`]:
+/// copy the latest window out of `buffer` if new samples have arrived since
+/// the last read, consuming the `new_data` flag either way.
+fn read_latest_locked(buffer: &Mutex<SharedBuffer>, out: &mut [f32]) -> usize {
+    let mut buf = buffer.lock().unwrap();
+    if !buf.new_data {
+        return 0;
+    }
+    let to_read = copy_latest(&buf.samples, out);
+    buf.new_data = false;
+    to_read
+}
+
 /// Fill an interleaved output buffer from queued mono samples, zero-filling
 /// once the queue runs dry.
 // PERF: pop_front is O(1); the previous Vec::remove(0) memmoved the entire
@@ -295,26 +308,56 @@ impl MicCapture {
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().unwrap().take()
     }
+
+    /// Build a [`MicReader`] over this capture's ring buffer.
+    ///
+    /// `cpal::Stream` is deliberately `!Send` (platform audio APIs tie
+    /// stream handles to the thread that created them), so `MicCapture`
+    /// itself can never move onto the pitch worker thread (issue #28).
+    /// `MicReader` carries only the `Arc`-shared buffer/error state
+    /// `read_samples`/`take_error` already used, so the worker can read
+    /// audio from another thread while `MicCapture` - and the stream it
+    /// owns - stays wherever it was created.
+    pub fn reader(&self) -> MicReader {
+        MicReader {
+            buffer: Arc::clone(&self.buffer),
+            error: Arc::clone(&self.error),
+            sample_rate: self.sample_rate,
+        }
+    }
 }
 
 impl AudioSource for MicCapture {
     fn read_samples(&mut self, buffer: &mut [f32]) -> usize {
-        let mut buf = self.buffer.lock().unwrap();
-
-        // Only return samples if we have new data
-        if !buf.new_data {
-            return 0;
-        }
-
-        // Copy the most recent samples (sliding window)
-        let to_read = copy_latest(&buf.samples, buffer);
-
-        buf.new_data = false;
-        to_read
+        read_latest_locked(&self.buffer, buffer)
     }
 
     fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+}
+
+/// `Send`-safe handle to a running [`MicCapture`]'s ring buffer. See
+/// [`MicCapture::reader`] for why this exists as a separate type instead of
+/// moving `MicCapture` itself onto the worker thread.
+#[derive(Clone)]
+pub struct MicReader {
+    buffer: Arc<Mutex<SharedBuffer>>,
+    error: Arc<Mutex<Option<String>>>,
+    sample_rate: u32,
+}
+
+impl AudioSource for MicReader {
+    fn read_samples(&mut self, buffer: &mut [f32]) -> usize {
+        read_latest_locked(&self.buffer, buffer)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn take_stream_error(&mut self) -> Option<String> {
+        self.error.lock().unwrap().take()
     }
 }
 
