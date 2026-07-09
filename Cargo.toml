@@ -48,3 +48,8 @@ approx = "0.5"
 # (tests/) only link the crate under test plus dev-dependencies, so the
 # detection harness needs its own entry to encode fixture WAVs.
 hound = "3.5"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
