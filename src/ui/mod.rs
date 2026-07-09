@@ -12,9 +12,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 pub mod app;
 pub mod components;
 pub mod screens;
+pub mod status;
 pub mod theme;
 
 pub use app::App;
+pub use status::{Severity, StatusId, StatusQueue};
 
 /// Type alias for our terminal.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
