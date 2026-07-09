@@ -102,8 +102,12 @@ impl Widget for &CalibrationScreen {
         block.render(area, buf);
 
         if inner.height < 10 || inner.width < 30 {
-            let msg = "Terminal too small";
-            buf.set_string(inner.x, inner.y, msg, Theme::warning());
+            // NOTE: set_string clips on x but indexes y unchecked, so guard
+            // against a zero-height/zero-width inner rect (e.g. a one-row pane).
+            if inner.height > 0 && inner.width > 0 {
+                let msg = "Terminal too small";
+                buf.set_string(inner.x, inner.y, msg, Theme::warning());
+            }
             return;
         }
 
@@ -218,6 +222,10 @@ mod tests {
         for (w, h) in [
             (0, 0),
             (1, 1),
+            (2, 0),  // wide-but-zero-height: fallback y is out of buffer
+            (2, 1),  // wide-but-one-row: inner.y == 1 is out of a 1-row buffer
+            (30, 1), // realistic dragged-thin pane
+            (80, 1), // one-row terminal / tmux split
             (10, 5),
             (29, 10), // just under the width gate
             (30, 9),  // just under the height gate
