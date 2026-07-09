@@ -1,6 +1,7 @@
 //! Tuning logic, temperament calculations, and session management.
 
 pub mod flow;
+pub mod inharmonicity;
 pub mod notes;
 pub mod order;
 pub mod profile;

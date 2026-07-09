@@ -39,9 +39,10 @@ pub enum StretchMode {
 
 // NOTE: `Profile` falls back to `Railsback` in `resolve` below rather than
 // silently reverting to pure equal temperament when no profile is loaded
-// yet. `StretchCurve::from_profile` is the literal measured-deviation table
-// today; issue #23's fitted inharmonicity model replaces just that builder,
-// not this enum or its CLI/config surface.
+// yet - and again when a loaded profile can't be fit (a legacy profile with
+// no partials, so `StretchCurve::from_profile` errors). Issue #23's fitted
+// inharmonicity model lives entirely behind that builder; this enum and its
+// CLI/config surface are untouched.
 
 impl StretchMode {
     /// Resolve this mode into a concrete curve (or `None` for no stretch).
@@ -53,7 +54,11 @@ impl StretchMode {
             StretchMode::Off => None,
             StretchMode::Railsback => Some(StretchCurve::railsback_default()),
             StretchMode::Profile => Some(match profile {
-                Some(profile) => StretchCurve::from_profile(profile),
+                // A profile we can fit yields the per-piano curve; one we
+                // can't (legacy, no partials) falls back to Railsback rather
+                // than failing the resolve.
+                Some(profile) => StretchCurve::from_profile(profile)
+                    .unwrap_or_else(|_| StretchCurve::railsback_default()),
                 None => StretchCurve::railsback_default(),
             }),
         }
@@ -88,19 +93,19 @@ impl StretchCurve {
         Self::from_offsets(Self::generate_railsback_curve())
     }
 
-    /// Build a curve from a loaded profile's measured per-key deviations
-    /// (`ProfiledNote::cents`), i.e. the piano's own measured stretch rather
-    /// than a generic population curve. Keys the profile never measured
-    /// (skipped notes, or an incomplete profile) keep 0.0 (no stretch) at
-    /// that index.
-    pub fn from_profile(profile: &PianoProfile) -> Self {
-        let mut offsets = [0.0_f32; 88];
-        for (offset, note) in offsets.iter_mut().zip(profile.notes.iter()) {
-            if let Some(note) = note {
-                *offset = note.cents;
-            }
-        }
-        Self::from_offsets(offsets)
+    /// Build a per-piano curve from a loaded profile by fitting each note's
+    /// inharmonicity coefficient `B` from its recorded partials and deriving
+    /// the stretch that keeps every octave's coincident partials beatless
+    /// (issue #23's [`crate::tuning::inharmonicity`] engine). This is the
+    /// physically-grounded curve for *this* instrument rather than a
+    /// population average.
+    ///
+    /// Errors when the profile has too few notes with usable partials to fit
+    /// a curve (a legacy profile saved before partials existed, or one where
+    /// nothing fit); callers fall back to the Railsback default.
+    pub fn from_profile(profile: &PianoProfile) -> anyhow::Result<Self> {
+        let offsets = crate::tuning::inharmonicity::stretch_from_profile(profile)?;
+        Ok(Self::from_offsets(offsets))
     }
 
     /// Get the stretch offset in cents for a given MIDI note.
@@ -179,6 +184,7 @@ impl Default for StretchCurve {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::Partial;
 
     #[test]
     fn test_bass_is_flat() {
@@ -391,27 +397,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_stretch_mode_profile_with_profile_uses_measured_curve() {
+    /// Partial stack of a stiff string with a known inharmonicity `B`.
+    fn inharmonic_partials(f0: f32, b: f32) -> Vec<Partial> {
+        (1..=6u16)
+            .map(|n| {
+                let nf = n as f32;
+                Partial {
+                    n,
+                    freq_hz: nf * f0 * (1.0 + b * nf * nf).sqrt(),
+                    amplitude: 1.0 / nf,
+                }
+            })
+            .collect()
+    }
+
+    /// A full 88-key profile carrying the partials of a piano with mild,
+    /// realistic inharmonicity (higher toward the extremes).
+    fn profile_with_inharmonicity() -> PianoProfile {
         let mut profile = PianoProfile::new();
-        profile.record_note(21, 27.0, -12.5); // A0, measured 12.5 cents flat
+        for i in 0..88u8 {
+            let midi = i + 21;
+            let bass = ((69.0 - midi as f32) / 48.0).max(0.0);
+            let treble = ((midi as f32 - 69.0) / 39.0).max(0.0);
+            let b = 0.0002 + 0.0006 * bass * bass + 0.0006 * treble * treble;
+            let f0 = 440.0 * 2f32.powf((midi as f32 - 69.0) / 12.0);
+            profile.record_note_with_partials(midi, f0, 0.0, inharmonic_partials(f0, b));
+        }
+        profile
+    }
+
+    #[test]
+    fn test_stretch_mode_profile_with_partials_uses_fitted_curve() {
+        let profile = profile_with_inharmonicity();
+        let curve = StretchMode::Profile
+            .resolve(Some(&profile))
+            .expect("some curve");
+
+        // The fitted per-piano curve is bass-flat, treble-sharp, anchored at A4.
+        assert!(curve.offset_cents(21) < 0.0, "A0 flat");
+        assert!(curve.offset_cents(108) > 0.0, "C8 sharp");
+        assert!(curve.offset_cents(69).abs() < 0.001, "A4 anchored");
+        // ...and it is the fitted curve, not the Railsback fallback.
+        assert_ne!(
+            curve.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_stretch_mode_profile_without_partials_falls_back_to_railsback() {
+        // A legacy profile (measured cents but no partials) can't be fit, so
+        // Profile mode falls back to the Railsback default rather than 0.
+        let mut profile = PianoProfile::new();
+        profile.record_note(21, 27.0, -12.5); // no partials
 
         let curve = StretchMode::Profile
             .resolve(Some(&profile))
             .expect("some curve");
-        assert_eq!(curve.offset_cents(21), -12.5);
-        // Unmeasured keys stay at 0 (no stretch), not the Railsback value.
-        assert_eq!(curve.offset_cents(108), 0.0);
+        assert_eq!(
+            curve.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21)
+        );
     }
 
     #[test]
-    fn test_from_profile_uses_measured_cents_and_zero_for_unmeasured_keys() {
+    fn test_from_profile_errors_without_partials() {
         let mut profile = PianoProfile::new();
-        profile.record_note(69, 440.0, 3.25); // A4
+        profile.record_note(69, 440.0, 3.25); // A4, no partials
+        assert!(StretchCurve::from_profile(&profile).is_err());
+    }
 
-        let curve = StretchCurve::from_profile(&profile);
-        assert_eq!(curve.offset_cents(69), 3.25);
-        assert_eq!(curve.offset_cents(21), 0.0);
-        assert_eq!(curve.offset_cents(108), 0.0);
+    #[test]
+    fn test_from_profile_with_partials_yields_monotonic_curve() {
+        let profile = profile_with_inharmonicity();
+        let curve = StretchCurve::from_profile(&profile).expect("fits a curve");
+
+        let mut prev = curve.offset_cents(21);
+        for midi in 22..=108 {
+            let current = curve.offset_cents(midi);
+            assert!(
+                current >= prev - 1e-3,
+                "curve should rise across the keyboard: MIDI {midi} {current} < {prev}"
+            );
+            prev = current;
+        }
     }
 }
