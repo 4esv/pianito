@@ -386,6 +386,12 @@ impl App {
         self.tuning.as_ref().map(|t| t.target_freq())
     }
 
+    /// The muting-step level/VU indicator's current level, if a tuning
+    /// screen is active (issue #32 deferred item).
+    pub fn tuning_mute_level(&self) -> Option<f32> {
+        self.tuning.as_ref().map(|t| t.mute_level())
+    }
+
     /// Handle key press event. The help overlay gets first look at every
     /// key, on every screen: `?` opens it, and while open it swallows
     /// whatever key closes it, so that key never also acts on the screen
@@ -690,8 +696,14 @@ impl App {
                         // the in-tune zone. The latch is NOT re-armed by an
                         // out-of-tolerance reading — the microphone may pick
                         // up the beep itself and the retrigger would loop.
-                        let is_muting =
-                            tuning.tuning_step().map(|s| s.is_muting()).unwrap_or(false);
+                        let is_muting = tuning.shows_mute_level();
+                        if is_muting {
+                            // No pitch target to compare against while
+                            // muting - feed the meter area's level/VU
+                            // indicator from detection confidence instead
+                            // (issue #32 deferred item) so it isn't blank.
+                            tuning.set_mute_level(confidence);
+                        }
                         let locked = match &mut self.flow {
                             Some(flow) => flow.observe_lock(cents, self.tolerance, is_muting),
                             None => false,
@@ -1394,6 +1406,31 @@ mod tests {
         let target = app.current_target_freq().unwrap();
         app.update_pitch(target, 0.9);
         assert!(!app.take_beep());
+    }
+
+    // -- muting-step level/VU indicator (issue #32 deferred item) --
+
+    #[test]
+    fn test_mute_level_reflects_confidence_during_muting_step() {
+        let mut app = App::with_config(&test_config(440.0));
+        app.start_session();
+        assert_eq!(app.state(), AppState::Tuning); // still on the mute step
+
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(target, 0.85);
+        assert_eq!(app.tuning_mute_level(), Some(0.85));
+    }
+
+    #[test]
+    fn test_mute_level_not_set_outside_a_muting_step() {
+        let mut app = beeping_app(5.0); // advanced past the mute step
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(target, 0.85);
+        assert_eq!(
+            app.tuning_mute_level(),
+            Some(0.0),
+            "no muting step active - level stays at its default"
+        );
     }
 
     #[test]
