@@ -134,6 +134,7 @@ Flags:
 | `Space` | Confirm current step / note |
 | `B` | Back to previous step / note |
 | `P` | Toggle piano progress display |
+| `?` | Toggle the help overlay |
 | `S` | Skip current note (on the Quick Tune calibration screen: skip calibration, use the configured A4 reference) |
 | `Q` / `Esc` | Quit (progress is saved after each confirmed note) |
 
