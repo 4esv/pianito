@@ -1,9 +1,11 @@
 //! Main application state machine.
 
+use std::time::Instant;
+
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, widgets::Paragraph, Frame};
 
-use crate::audio::{PartialAnalyzer, PitchDetector};
+use crate::audio::{PartialAnalyzer, PitchDetector, SilenceWatchdog};
 use crate::config::EffectiveConfig;
 use crate::tuning::flow::TuningFlow;
 use crate::tuning::order::TuningOrder;
@@ -17,6 +19,7 @@ use super::screens::{
     mode_select::SelectedMode, CalibrationScreen, CompleteScreen, ModeSelectScreen,
     ProfilingScreen, TuningScreen,
 };
+use super::status::{Severity, StatusId, StatusQueue};
 use super::theme::Theme;
 
 /// Application screen state.
@@ -80,13 +83,17 @@ pub struct App {
     /// = pure equal temperament). Same role as `temperament`: pre-session
     /// copy, handed to the flow when the session starts.
     stretch: Option<StretchCurve>,
-    /// Most recent save failure (session autosave or profile save),
-    /// surfaced in the status line.
-    save_error: Option<String>,
-    /// Warning produced while resuming a session.
-    resume_warning: Option<String>,
-    /// Most recent audio-stream error reported by the capture backend.
-    audio_warning: Option<String>,
+    /// Multi-message status line (issue #34): audio warnings, save
+    /// failures, resume notes, and the silence-watchdog hint each keep
+    /// their own slot instead of one overwriting another.
+    status: StatusQueue,
+    /// Tracks time since the last mic read that carried real signal, to
+    /// surface a "check your microphone" hint on a dead (but error-free)
+    /// input stream — e.g. a macOS TCC permission denial, which delivers
+    /// silent zero samples rather than a `cpal` error (issue #34). Anchored
+    /// to `Instant::now()` at construction, so the idle clock starts
+    /// counting from app startup.
+    watchdog: SilenceWatchdog,
     /// '?' help overlay. Checked before any screen-specific key handling so
     /// its input never leaks through to the screen underneath.
     help: HelpOverlay,
@@ -126,9 +133,8 @@ impl App {
             beep_pending: false,
             stretch_mode: StretchMode::default(),
             stretch: Some(StretchCurve::railsback_default()),
-            save_error: None,
-            resume_warning: None,
-            audio_warning: None,
+            status: StatusQueue::new(),
+            watchdog: SilenceWatchdog::new(SilenceWatchdog::DEFAULT_TIMEOUT, Instant::now()),
             help: HelpOverlay::new(),
             sample_rate: Self::DEFAULT_SAMPLE_RATE,
             partial_analyzer: PartialAnalyzer::new(Self::DEFAULT_SAMPLE_RATE),
@@ -175,8 +181,13 @@ impl App {
                 None => {
                     // WARNING: without the saved profile the deviation order
                     // cannot be rebuilt; say so instead of switching silently.
-                    app.resume_warning =
-                        Some("Saved profile not found - resuming in traditional order".to_string());
+                    app.status.upsert(
+                        StatusId::ResumeWarning,
+                        "Saved profile not found - resuming in traditional order",
+                        Severity::Info,
+                        None,
+                        Instant::now(),
+                    );
                 }
             }
             app.recompute_stretch();
@@ -240,15 +251,51 @@ impl App {
     /// rendered in the status line; available for printing after terminal
     /// restore.
     pub fn save_error(&self) -> Option<&str> {
-        self.save_error.as_deref()
+        self.status.text_for(StatusId::SaveError)
     }
 
     /// Record an audio-stream error (e.g. microphone unplugged) for display
-    /// in the status line. The main loop polls `MicCapture::take_error` and
-    /// parks the message here instead of writing to stderr while the
+    /// in the status line. The main loop forwards the pitch worker's
+    /// `take_audio_warning` here instead of writing to stderr while the
     /// terminal is in raw mode.
     pub fn set_audio_warning(&mut self, msg: String) {
-        self.audio_warning = Some(msg);
+        self.status.upsert(
+            StatusId::AudioWarning,
+            msg,
+            Severity::Warning,
+            None,
+            Instant::now(),
+        );
+    }
+
+    /// Record the pitch worker's latest mic-read signal state (issue #34/#28):
+    /// feeds the silence watchdog with whether the most recent read carried
+    /// real signal, independent of whether a pitch was actually detected in
+    /// it (a quiet moment between strikes is not a dead mic). A signal-bearing
+    /// read re-arms the idle timer; a run of exact-zero reads (a dead but
+    /// error-free stream) lets it elapse.
+    pub fn observe_audio_signal(&mut self, has_signal: bool, now: Instant) {
+        self.watchdog.observe(has_signal, now);
+    }
+
+    /// Per-render-tick upkeep for time-driven state: raises or clears the
+    /// silence-watchdog hint, and expires/rotates the status queue. Runs at
+    /// render cadence so it advances even on ticks with no pitch event
+    /// (`now` is explicit so both are deterministic under test).
+    pub fn tick(&mut self, now: Instant) {
+        if self.watchdog.is_idle(now) {
+            self.status.upsert(
+                StatusId::SilenceWatchdog,
+                "No audio input detected - check microphone permissions \
+                 (System Settings > Privacy > Microphone)",
+                Severity::Warning,
+                None,
+                now,
+            );
+        } else {
+            self.status.clear(StatusId::SilenceWatchdog);
+        }
+        self.status.tick(now);
     }
 
     /// Set the sample rate of the active audio input (called once by `main`
@@ -530,7 +577,13 @@ impl App {
             // parked in save_error for the status line (and for printing
             // after restore on quit).
             if let Err(e) = profile.save() {
-                self.save_error = Some(format!("Failed to save profile: {}", e));
+                self.status.upsert(
+                    StatusId::SaveError,
+                    format!("Failed to save profile: {}", e),
+                    Severity::Warning,
+                    None,
+                    Instant::now(),
+                );
             }
 
             // Tuning order based on profile deviations.
@@ -776,8 +829,14 @@ impl App {
             None => return,
         };
         match result {
-            Ok(()) => self.save_error = None,
-            Err(e) => self.save_error = Some(format!("Session save failed: {}", e)),
+            Ok(()) => self.status.clear(StatusId::SaveError),
+            Err(e) => self.status.upsert(
+                StatusId::SaveError,
+                format!("Session save failed: {}", e),
+                Severity::Warning,
+                None,
+                Instant::now(),
+            ),
         }
     }
 
@@ -792,14 +851,15 @@ impl App {
         self.mode_select = ModeSelectScreen::new();
         self.mode_select.select(self.default_mode);
         self.calibration = CalibrationScreen::new();
-        self.save_error = None;
-        self.resume_warning = None;
+        self.status.clear(StatusId::SaveError);
+        self.status.clear(StatusId::ResumeWarning);
         self.beep_pending = false;
         // NOTE: tolerance and beep_enabled are config-scoped and survive
         // reset, like configured_a4.
-        // NOTE: audio_warning is deliberately kept across reset — a dead
-        // mic stays dead in the next session and cpal fatal stream errors
-        // fire only once, so clearing here would hide the only sign of it.
+        // NOTE: AudioWarning and SilenceWatchdog are deliberately kept
+        // across reset — a dead mic stays dead in the next session and cpal
+        // fatal stream errors fire only once, so clearing here would hide
+        // the only sign of it.
     }
 
     /// Render the current screen.
@@ -830,15 +890,11 @@ impl App {
             }
         }
 
-        // Status line for audio errors / save failures / resume warnings,
-        // drawn over the bottom border of every screen so it can't be
-        // missed (audio errors can occur in any state)
-        let status = self
-            .audio_warning
-            .as_deref()
-            .or(self.save_error.as_deref())
-            .or(self.resume_warning.as_deref());
-        if let Some(msg) = status {
+        // Status line: audio errors / save failures / resume notes / the
+        // silence-watchdog hint each keep their own slot in `status` and
+        // rotate through, drawn over the bottom border of every screen so
+        // it can't be missed (these can occur in any state).
+        if let Some((msg, severity)) = self.status.current() {
             if area.height > 2 && area.width > 4 {
                 let status_area = Rect::new(
                     area.x + 2,
@@ -846,8 +902,12 @@ impl App {
                     area.width.saturating_sub(4),
                     1,
                 );
-                let warning = Paragraph::new(msg).style(Theme::warning());
-                frame.render_widget(warning, status_area);
+                let style = match severity {
+                    Severity::Warning => Theme::warning(),
+                    Severity::Info => Theme::muted(),
+                };
+                let status_line = Paragraph::new(msg).style(style);
+                frame.render_widget(status_line, status_area);
             }
         }
 
@@ -867,6 +927,8 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::audio::TestAudioSource;
 
@@ -1144,7 +1206,7 @@ mod tests {
         // configured_a4 stays config-scoped: a new session started after
         // this resume must not inherit the resumed session's A4
         assert!((app.configured_a4 - 440.0).abs() < f32::EPSILON);
-        assert!(app.resume_warning.is_none());
+        assert!(app.status.text_for(StatusId::ResumeWarning).is_none());
     }
 
     #[test]
@@ -1504,5 +1566,92 @@ mod tests {
 
         let profiling = app.profiling.as_ref().unwrap();
         assert_eq!(profiling.current_partials(), expected.as_slice());
+    }
+
+    // ---- Silence watchdog + multi-message status line (issue #34) --------
+
+    /// A fresh app plus an `Instant` guaranteed to be at or after the
+    /// watchdog's internal `Instant::now()` anchor from construction (taken
+    /// *after* `App::new()` returns) — so timeouts measured from it never
+    /// undercount the elapsed time relative to that anchor.
+    fn app_with_now() -> (App, Instant) {
+        let app = App::new();
+        (app, Instant::now())
+    }
+
+    #[test]
+    fn test_watchdog_hint_appears_after_timeout_with_no_signal() {
+        let (mut app, t0) = app_with_now();
+
+        // Ticks alone (no pitch events at all) must be enough to raise the
+        // hint — the render loop advances independent of pitch arrival.
+        app.tick(t0);
+        assert!(app.status.current().is_none(), "must not warn immediately");
+
+        app.tick(t0 + SilenceWatchdog::DEFAULT_TIMEOUT);
+        let (msg, severity) = app.status.current().expect("hint must be shown once idle");
+        assert!(msg.contains("microphone permissions"));
+        assert_eq!(severity, Severity::Warning);
+    }
+
+    #[test]
+    fn test_watchdog_hint_clears_once_signal_returns() {
+        let (mut app, t0) = app_with_now();
+
+        app.tick(t0 + SilenceWatchdog::DEFAULT_TIMEOUT);
+        assert!(app.status.current().is_some());
+
+        let t1 = t0 + SilenceWatchdog::DEFAULT_TIMEOUT + Duration::from_secs(1);
+        app.observe_audio_signal(true, t1);
+        app.tick(t1);
+
+        assert!(app.status.current().is_none(), "signal must clear the hint");
+    }
+
+    #[test]
+    fn test_silent_reads_do_not_reset_the_watchdog() {
+        // A read with no signal (dead mic) must not itself count as
+        // "activity" and postpone the hint.
+        let (mut app, t0) = app_with_now();
+
+        app.observe_audio_signal(false, t0 + Duration::from_secs(5));
+        app.tick(t0 + SilenceWatchdog::DEFAULT_TIMEOUT);
+
+        assert!(app.status.current().is_some());
+    }
+
+    #[test]
+    fn test_multiple_status_messages_rotate_without_masking_each_other() {
+        // Regression for the old single-Option priority chain: a persistent
+        // audio warning used to permanently mask a save error.
+        let t0 = Instant::now();
+        let mut app = App::new();
+        app.set_audio_warning("mic unplugged".to_string());
+        app.status.upsert(
+            StatusId::SaveError,
+            "save failed",
+            Severity::Warning,
+            None,
+            t0,
+        );
+
+        assert_eq!(app.save_error(), Some("save failed"));
+        assert!(
+            app.status.text_for(StatusId::AudioWarning).is_some(),
+            "the audio warning must still be enqueued, not overwritten"
+        );
+
+        // Both are reachable via rotation, not just the first-set one.
+        let mut seen = std::collections::HashSet::new();
+        let mut now = t0;
+        for _ in 0..4 {
+            app.tick(now);
+            if let Some((msg, _)) = app.status.current() {
+                seen.insert(msg.to_string());
+            }
+            now += StatusQueue::ROTATE_INTERVAL;
+        }
+        assert!(seen.contains("mic unplugged"));
+        assert!(seen.contains("save failed"));
     }
 }
