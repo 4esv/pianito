@@ -25,6 +25,11 @@ Findings from the July 2026 codebase audit + landscape research:
 
 ## Stages
 
+> **Status (2026-07-09):** Stages 0-4 are complete and ship together as
+> v0.1.0 - the crate was never published early, so the per-stage version
+> gates below are historical. Remaining: Stage 5 (ship), #39 (demo GIF),
+> and Stage 7 (launch).
+
 | Stage | Theme | Issues | Version gate |
 |-------|-------|--------|--------------|
 | [0](https://github.com/4esv/pianito/milestone/1) | Housekeeping — publishable metadata, community files, honest MSRV | #5–#9 | — |
