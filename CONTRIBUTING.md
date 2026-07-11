@@ -16,7 +16,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-All three must pass. CI runs on macOS and is the final arbiter if your local
+All three must pass. CI runs the same gates on a macOS + Ubuntu matrix (plus
+`cargo audit` and an MSRV check) and is the final arbiter if your local
 toolchain lags behind.
 
 ## Commit style
