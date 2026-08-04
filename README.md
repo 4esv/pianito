@@ -13,12 +13,12 @@
 
 pianito is a command-line piano tuner. It does real-time pitch detection (the
 YIN algorithm), measures each piano's inharmonicity from its own overtones, and
-tunes to an equal-tempered scale with a Railsback stretch curve — then walks you
-through the strings note by note. No GUI, no phone, no account. A microphone, a
-terminal, and a piano.
+tunes to an equal-tempered scale with a Railsback stretch curve. Then it walks
+you through the strings note by note. No GUI, no phone, no account. A
+microphone, a terminal, and a piano.
 
 If you searched "CLI piano tuner" or "open source piano tuning app" and landed
-here: as far as I can tell there isn't another terminal piano tuner, so this is
+here, there isn't another terminal piano tuner as far as I can tell, so this is
 the one.
 
 ## What it stacks up against
@@ -41,9 +41,9 @@ partial display. Here is honestly where pianito stands against that bar today.
 | Live spectrum / phase scope | ❌ | partials are measured during profiling, not shown as a running analyzer |
 | Mobile / desktop GUI | ❌ *by design* | it runs in a terminal |
 
-Short version: pianito already does the two things that separate a real tuner
-from a chromatic-tuner app — it measures a specific piano's inharmonicity and
-stretches the scale to fit it — and it adds step-by-step unison coaching the
+pianito already does the two things that separate a real tuner from a
+chromatic-tuner app: it measures a specific piano's inharmonicity and
+stretches the scale to fit it, and it adds step-by-step unison coaching the
 others don't. It does not yet do historical temperaments or pitch-raise
 overpull, and it will never be a phone app.
 
