@@ -11,11 +11,10 @@
 ![pianito — a piano tuner for the terminal](docs/demo.gif)
 -->
 
-pianito is a command-line piano tuner. It does real-time pitch detection (the
-YIN algorithm), measures each piano's inharmonicity from its own overtones, and
-tunes to an equal-tempered scale with a Railsback stretch curve — then walks you
-through the strings note by note. No GUI, no phone, no account. A microphone, a
-terminal, and a piano.
+pianito is a command-line piano tuner. It detects pitch in real time (the YIN
+algorithm) and measures each piano's inharmonicity from its own overtones. It
+tunes to an equal-tempered scale with a Railsback stretch curve, then walks you
+through the strings note by note. No GUI, no phone, no account. A microphone, a terminal, and a piano.
 
 If you searched "CLI piano tuner" or "open source piano tuning app" and landed
 here: as far as I can tell there isn't another terminal piano tuner, so this is
@@ -23,10 +22,10 @@ the one.
 
 ## What it stacks up against
 
-The professional apps — **Entropy Piano Tuner** (open source), **Verituner**,
-**TuneLab**, and **PianoMeter** — set the vocabulary piano technicians scan for:
+The professional apps are Entropy Piano Tuner (open source), Verituner, TuneLab
+and PianoMeter. They set the vocabulary piano technicians scan for:
 inharmonicity measurement, per-piano stretch, temperaments, pitch raise, a live
-partial display. Here is honestly where pianito stands against that bar today.
+partial display. Here is where pianito stands against that bar today.
 
 | Capability | pianito | Notes |
 |---|:---:|---|
@@ -42,10 +41,10 @@ partial display. Here is honestly where pianito stands against that bar today.
 | Mobile / desktop GUI | ❌ *by design* | it runs in a terminal |
 
 Short version: pianito already does the two things that separate a real tuner
-from a chromatic-tuner app — it measures a specific piano's inharmonicity and
-stretches the scale to fit it — and it adds step-by-step unison coaching the
-others don't. It does not yet do historical temperaments or pitch-raise
-overpull, and it will never be a phone app.
+from a chromatic-tuner app. It measures a specific piano's inharmonicity, and it
+stretches the scale to fit. It also adds step-by-step unison coaching the others
+don't have. It does not yet do historical temperaments or pitch-raise overpull,
+and it will never be a phone app.
 
 ## Installation
 
@@ -75,16 +74,16 @@ cargo binstall pianito
 
 ### From source
 
-Requires Rust 1.82+. On Linux, also install the ALSA
-development headers and `pkg-config` first (cpal's ALSA backend links against
-`libasound` at build time):
+Requires Rust 1.82+. On Linux, first install the ALSA
+development headers and `pkg-config`. cpal's ALSA backend links against
+`libasound` at build time:
 
 ```bash
 # Debian/Ubuntu
 sudo apt install libasound2-dev pkg-config
 ```
 
-macOS needs nothing extra — it links CoreAudio directly.
+macOS needs nothing extra. It links CoreAudio directly.
 
 ```bash
 git clone https://github.com/4esv/pianito.git
@@ -118,18 +117,17 @@ pianito --quick
 Flags:
 
 - `--a4 <HZ>` sets the reference frequency for Concert Pitch and Profile
-  sessions (and the fallback when skipping Quick Tune calibration). Also
-  applies to the `reference` and `analyze` subcommands. On `--resume`, the
+  sessions. It is also the fallback when you skip Quick Tune calibration, and
+  it applies to the `reference` and `analyze` subcommands. On `--resume`, the
   session's original A4 wins.
 - `--quick` preselects Quick Tune in the mode-select menu.
 - `--beep` plays a short beep the moment a string first enters the in-tune
-  zone (once per strike; silence re-arms it). Requires an audio output
-  device — without one, tuning continues and a warning shows in the status
-  line.
+  zone (once per strike; silence re-arms it). It needs an audio output
+  device. Without one, tuning continues and the status line shows a warning.
 - `--stretch <off|railsback|profile>` picks how tuning targets are stretched:
   pure equal temperament, the built-in Railsback curve (the default), or the
-  per-piano curve measured in Profile mode (falls back to Railsback until a
-  profile is loaded).
+  per-piano curve measured in Profile mode. `profile` falls back to Railsback
+  until a profile is loaded.
 
 ### Keyboard controls
 
@@ -202,28 +200,28 @@ stretch = "railsback"
    - Octaves downward (E3-A0): 32 notes
 4. **Multi-string Coaching**: Coaches each note based on its string count:
    - A0-A#1 (1 string): tune directly
-   - B1-G#3 (bichord, 2 strings): 2 steps — mute the right string, tune the left, then unmute and match the right
-   - A3-C8 (trichord, 3 strings): 4 steps — mute the outer strings, tune the center, then left and right unisons
+   - B1-G#3 (bichord, 2 strings): 2 steps. Mute the right string, tune the left, then unmute and match the right
+   - A3-C8 (trichord, 3 strings): 4 steps. Mute the outer strings, tune the center, then left and right unisons
 
 ### Profile mode
 
 Profile mode measures the whole piano before tuning it. Play all 88 keys
-(A0→C8) one at a time; pianito records each note's deviation in cents. The
+(A0→C8) one at a time, and pianito records each note's deviation in cents. The
 profile is saved under the pianito data directory:
 
 - macOS: `~/Library/Application Support/pianito/profiles`
 - Linux: `~/.local/share/pianito/profiles` (or `$XDG_DATA_HOME/pianito/profiles`)
 
-Then tuning starts with the order reshuffled: the temperament octave (F3-F4)
-stays first, and the remaining notes follow worst-deviation-first.
+Tuning then starts in a new order. The temperament octave (F3-F4) stays
+first, and the remaining notes follow worst-deviation-first.
 
 On the profiling screen: `Space` confirms the current note, `B` goes back,
 `S` skips a note, `Q`/`Esc` quits.
 
-Profiling also records each note's partial spectrum, which pianito fits
+Profiling also records each note's partial spectrum, and pianito fits those
 into a per-piano inharmonicity curve. Tune with `--stretch profile` (or
 `stretch = "profile"` in config.toml) to have that curve drive the tuning
-targets — see [`docs/inharmonicity.md`](docs/inharmonicity.md) for why the
+targets. [`docs/inharmonicity.md`](docs/inharmonicity.md) explains why the
 stretch is necessary and how it's measured.
 
 ## Requirements
@@ -237,15 +235,14 @@ stretch is necessary and how it's measured.
 | Build-time deps | none beyond Rust | `libasound2-dev`, `pkg-config` |
 | Runtime deps | none beyond the OS | `libasound2` |
 
-The codebase itself has no `cfg(target_os)` branches and no macOS-specific
-APIs — audio I/O goes through cpal and paths through the `directories` crate,
-so Linux support falls out of the same code, not a separate port. CI builds and
-tests on both macOS and Ubuntu (see
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+The codebase has no `cfg(target_os)` branches and no macOS-specific APIs.
+Audio I/O goes through cpal and paths through the `directories` crate, so Linux
+runs the same code rather than a separate port. CI builds and tests on both
+macOS and Ubuntu (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
-One caveat: ALSA loads its plugins via `dlopen` at runtime, so
-statically-linked musl builds aren't supported — use the glibc target (the
-prebuilt Linux binary already does).
+ALSA loads its plugins via `dlopen` at runtime, so statically-linked musl
+builds aren't supported. Use the glibc target (the prebuilt Linux binary
+already does).
 
 ## License
 
