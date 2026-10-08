@@ -123,12 +123,22 @@ impl StretchCurve {
     }
 
     /// Generate the Railsback-inspired default table.
+    ///
+    /// The raw [`Self::calculate_stretch`] quadratic has its zero at C4
+    /// (MIDI 60), but consumers treat A4 (MIDI 69) as the reference pitch:
+    /// `offset_cents(69)` is the cents offset applied on top of the
+    /// configured A4. Anchoring the default at C4 would leave A4 at
+    /// +0.84 cents, so with `--a4 430` the actual A4 target would be
+    /// 430.21 Hz (issue #88). Subtract `calculate_stretch(69)` from every
+    /// entry - a pure vertical shift, so the curve's shape (the per-semitone
+    /// deltas) is unchanged and only the zero-anchor moves from C4 to A4.
     fn generate_railsback_curve() -> [f32; 88] {
+        let anchor = Self::calculate_stretch(69);
         let mut offsets = [0.0_f32; 88];
 
         for (i, offset) in offsets.iter_mut().enumerate() {
             let midi = (i + 21) as u8;
-            *offset = Self::calculate_stretch(midi);
+            *offset = Self::calculate_stretch(midi) - anchor;
         }
 
         offsets
@@ -140,6 +150,10 @@ impl StretchCurve {
     /// - A0 (21): approximately -15.7 cents
     /// - C4 (60): approximately 0 cents
     /// - C8 (108): approximately +23.8 cents
+    ///
+    /// These are the *un-anchored* values; [`Self::generate_railsback_curve`]
+    /// subtracts this function's A4 value from every entry so the built
+    /// default reads 0.0 cents at A4.
     ///
     /// NOTE: `center`/`range` are NOT symmetric around the 88-key span
     /// (MIDI 21-108, midpoint 64.5, half-span 43.5). `center = 60` (middle
@@ -288,35 +302,34 @@ mod tests {
         assert_eq!(curve.offset_cents(109), 0.0);
     }
 
-    // NOTE: characterization test for issue #18 - pins the exact per-note
-    // stretch offsets produced by the pre-refactor implementation, bit for
-    // bit. This is the proof that the data/builder refactor changed no
-    // observable behavior: it must stay green, unmodified in its expected
-    // values, across the refactor commit (only the constructor call below is
-    // renamed alongside the production call sites).
+    // NOTE: characterization test for the Railsback default's exact per-note
+    // stretch offsets, bit for bit. It was introduced for issue #18 to prove
+    // the data/builder refactor changed no observable behavior; issue #88 then
+    // re-anchored the curve at A4 (a pure vertical shift of
+    // `calculate_stretch(69)`), so the table below pins the *anchored* values.
+    // Any further drift must be intentional and this table updated with it.
     #[test]
     fn test_railsback_offsets_characterization() {
         // Index 0 = A0 (MIDI 21) ... index 87 = C8 (MIDI 108). Captured from
-        // StretchCurve::new() (pre-refactor name; now railsback_default()) via
-        // f32::to_bits() for exact reproduction (avoids decimal-literal
-        // rounding drift).
+        // StretchCurve::railsback_default() via f32::to_bits() for exact
+        // reproduction (avoids decimal-literal rounding drift).
         // NOTE: `let`, not `const` - const `f32::from_bits` is only stable
         // since Rust 1.83, and this crate's MSRV floor is 1.82. Non-const
         // `f32::from_bits` has been stable since 1.20, so a runtime binding
         // keeps the exact-bits table while compiling on the declared MSRV.
         #[rustfmt::skip]
         let expected: [f32; 88] = [
-            f32::from_bits(3246090155), f32::from_bits(3245256062), f32::from_bits(3244443631), f32::from_bits(3243652866), f32::from_bits(3242883766), f32::from_bits(3242136330), f32::from_bits(3241410560), f32::from_bits(3240706455),
-            f32::from_bits(3240024013), f32::from_bits(3239363237), f32::from_bits(3238724127), f32::from_bits(3238106678), f32::from_bits(3237019108), f32::from_bits(3235870871), f32::from_bits(3234765967), f32::from_bits(3233704393),
-            f32::from_bits(3232686147), f32::from_bits(3231711232), f32::from_bits(3230779645), f32::from_bits(3229891390), f32::from_bits(3228478846), f32::from_bits(3226875650), f32::from_bits(3225359114), f32::from_bits(3223929239),
-            f32::from_bits(3222586021), f32::from_bits(3221329462), f32::from_bits(3219093655), f32::from_bits(3216927177), f32::from_bits(3214934016), f32::from_bits(3213114174), f32::from_bits(3210098434), f32::from_bits(3207152023),
-            f32::from_bits(3204552246), f32::from_bits(3200149961), f32::from_bits(3196336958), f32::from_bits(3190374807), f32::from_bits(3183372745), f32::from_bits(3173597591), f32::from_bits(3156820375), f32::from_bits(0),
-            f32::from_bits(1009336727), f32::from_bits(1026113943), f32::from_bits(1035889097), f32::from_bits(1042891159), f32::from_bits(1048853310), f32::from_bits(1052666313), f32::from_bits(1057068598), f32::from_bits(1059668375),
-            f32::from_bits(1062614786), f32::from_bits(1065630526), f32::from_bits(1067450368), f32::from_bits(1069443529), f32::from_bits(1071610007), f32::from_bits(1073845814), f32::from_bits(1075102373), f32::from_bits(1076445591),
-            f32::from_bits(1077875466), f32::from_bits(1079392002), f32::from_bits(1080995198), f32::from_bits(1082407742), f32::from_bits(1083295997), f32::from_bits(1084227584), f32::from_bits(1085202499), f32::from_bits(1086220745),
-            f32::from_bits(1087282319), f32::from_bits(1088387223), f32::from_bits(1089535460), f32::from_bits(1090623030), f32::from_bits(1091240479), f32::from_bits(1091879589), f32::from_bits(1092540365), f32::from_bits(1093222807),
-            f32::from_bits(1093926912), f32::from_bits(1094652682), f32::from_bits(1095400118), f32::from_bits(1096169218), f32::from_bits(1096959983), f32::from_bits(1097772414), f32::from_bits(1098606507), f32::from_bits(1099184958),
-            f32::from_bits(1099623670), f32::from_bits(1100073213), f32::from_bits(1100533592), f32::from_bits(1101004800), f32::from_bits(1101486841), f32::from_bits(1101979715), f32::from_bits(1102483424), f32::from_bits(1102997961),
+            f32::from_bits(3246679438), f32::from_bits(3246133486), f32::from_bits(3245321055), f32::from_bits(3244530290), f32::from_bits(3243761190), f32::from_bits(3243013754), f32::from_bits(3242287984), f32::from_bits(3241583879),
+            f32::from_bits(3240901437), f32::from_bits(3240240661), f32::from_bits(3239601551), f32::from_bits(3238984102), f32::from_bits(3238388322), f32::from_bits(3237625719), f32::from_bits(3236520815), f32::from_bits(3235459241),
+            f32::from_bits(3234440995), f32::from_bits(3233466080), f32::from_bits(3232534493), f32::from_bits(3231646238), f32::from_bits(3230801311), f32::from_bits(3229999713), f32::from_bits(3228868810), f32::from_bits(3227438936),
+            f32::from_bits(3226095718), f32::from_bits(3224839158), f32::from_bits(3223669260), f32::from_bits(3222586021), f32::from_bits(3221589440), f32::from_bits(3220133567), f32::from_bits(3218487042), f32::from_bits(3217013836),
+            f32::from_bits(3215713948), f32::from_bits(3214587379), f32::from_bits(3213634128), f32::from_bits(3212854196), f32::from_bits(3211658299), f32::from_bits(3210791707), f32::from_bits(3210271752), f32::from_bits(3210098434),
+            f32::from_bits(3209925116), f32::from_bits(3209405161), f32::from_bits(3208538569), f32::from_bits(3207325340), f32::from_bits(3205765475), f32::from_bits(3203269691), f32::from_bits(3198763416), f32::from_bits(3191068076),
+            f32::from_bits(0), f32::from_bits(1044970984), f32::from_bits(1054052860), f32::from_bits(1059495056), f32::from_bits(1063828012), f32::from_bits(1066930411), f32::from_bits(1069443529), f32::from_bits(1072129965),
+            f32::from_bits(1074365770), f32::from_bits(1075882306), f32::from_bits(1077485502), f32::from_bits(1079175356), f32::from_bits(1080951866), f32::from_bits(1082472736), f32::from_bits(1083447651), f32::from_bits(1084465897),
+            f32::from_bits(1085527471), f32::from_bits(1086632375), f32::from_bits(1087780612), f32::from_bits(1088972172), f32::from_bits(1090207070), f32::from_bits(1091002165), f32::from_bits(1091662941), f32::from_bits(1092345383),
+            f32::from_bits(1093049488), f32::from_bits(1093775258), f32::from_bits(1094522694), f32::from_bits(1095291794), f32::from_bits(1096082559), f32::from_bits(1096894990), f32::from_bits(1097729083), f32::from_bits(1098584844),
+            f32::from_bits(1099184958), f32::from_bits(1099634501), f32::from_bits(1100094880), f32::from_bits(1100566088), f32::from_bits(1101048129), f32::from_bits(1101541003), f32::from_bits(1102044712), f32::from_bits(1102559249),
         ];
 
         let curve = StretchCurve::railsback_default();
@@ -335,12 +348,23 @@ mod tests {
             );
         }
 
-        // Spot-check readable landmarks against the issue's own numbers so a
-        // future reader can sanity-check the bit table above at a glance.
-        assert!((curve.offset_cents(21) - (-15.712_81)).abs() < 0.001); // A0
-        assert!(curve.offset_cents(60).abs() < 0.001); // C4
-        assert!((curve.offset_cents(69) - 0.836_776_85).abs() < 0.001); // A4
-        assert!((curve.offset_cents(108) - 23.801_653).abs() < 0.001); // C8
+        // Spot-check readable landmarks so a future reader can sanity-check
+        // the bit table above at a glance. Note C4 now sits 0.84 cents flat
+        // of A4: the curve is anchored at A4, not C4 (issue #88).
+        assert!((curve.offset_cents(21) - (-16.549_587)).abs() < 0.001); // A0
+        assert!((curve.offset_cents(60) - (-0.836_776_85)).abs() < 0.001); // C4
+        assert!(curve.offset_cents(69).abs() < 0.001, "A4 anchored"); // A4
+        assert!((curve.offset_cents(108) - 22.964_876).abs() < 0.001); // C8
+    }
+
+    #[test]
+    fn test_railsback_default_is_anchored_at_a4() {
+        // Issue #88: the default curve must read 0.0 cents at A4 (MIDI 69),
+        // matching how the per-piano profile curve is anchored - consumers
+        // apply this offset on top of the configured A4, so a non-zero A4
+        // here biases every target.
+        let curve = StretchCurve::railsback_default();
+        assert!(curve.offset_cents(69).abs() < 0.001, "A4 anchored");
     }
 
     #[test]
