@@ -260,13 +260,21 @@ impl PianoProfile {
         let path = self
             .profile_path()
             .ok_or_else(|| anyhow::anyhow!("Could not determine profiles directory"))?;
+        self.save_to(path)
+    }
 
+    /// Write this profile's JSON to `path`, creating its parent directory if
+    /// needed. Split out of [`Self::save`] so the on-disk shape of a partial
+    /// profile - the unvisited keys' `None` holes (issue #87) - can be
+    /// round-tripped against a temp file instead of the user's data dir.
+    pub fn save_to(&self, path: impl AsRef<Path>) -> anyhow::Result<()> {
+        let path = path.as_ref();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json)?;
+        fs::write(path, json)?;
 
         Ok(())
     }
@@ -588,6 +596,36 @@ mod tests {
         let a4 = loaded.notes[0].as_ref().expect("note recorded");
         assert_eq!(a4.target_freq, 0.0);
         assert_eq!(a4.confidence, 0.0);
+    }
+
+    #[test]
+    fn test_partial_profile_round_trips_through_save_and_load() {
+        // Issue #87: the profile autosaved partway through the keyboard (a
+        // few measured notes, the rest still `None` holes) must come back
+        // intact, so `--stretch profile` can still fit what was measured.
+        let temp_dir = tempfile::TempDir::new().expect("Should create temp dir");
+        let path = temp_dir.path().join("partial.json");
+
+        let mut profile = PianoProfile::new();
+        profile.set_a4_reference(442.0);
+        profile.record_note_full(21, 27.4, -3.0, 27.5, 0.9, sample_partials());
+        profile.record_note_full(33, 55.1, 2.0, 55.0, 0.8, sample_partials());
+
+        profile.save_to(&path).expect("partial profile must save");
+
+        let loaded = PianoProfile::load(&path).expect("partial profile must load");
+        assert_eq!(loaded.notes.len(), NOTE_COUNT);
+        assert_eq!(loaded.progress(), (2, NOTE_COUNT));
+        assert!(!loaded.is_complete(), "two keys is not a whole piano");
+        assert!((loaded.a4_reference - 442.0).abs() < 0.01);
+
+        let a0 = loaded.notes[0].as_ref().expect("A0 recorded");
+        assert_eq!(a0.midi, 21);
+        assert_eq!(a0.partials, sample_partials());
+        assert!(
+            loaded.notes[87].is_none(),
+            "unvisited keys stay holes, not fabricated measurements"
+        );
     }
 
     #[test]

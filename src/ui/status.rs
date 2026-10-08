@@ -23,6 +23,9 @@ pub enum StatusId {
     ResumeWarning,
     /// Dead-input hint from [`crate::audio::SilenceWatchdog`].
     SilenceWatchdog,
+    /// The last reading is outside tolerance and the next confirm press will
+    /// save it (issue #81).
+    OutOfTolerance,
 }
 
 /// Display severity, driving status-line styling.

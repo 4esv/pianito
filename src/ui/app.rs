@@ -1,6 +1,6 @@
 //! Main application state machine.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyCode;
 use ratatui::{layout::Rect, widgets::Paragraph, Frame};
@@ -105,6 +105,11 @@ pub struct App {
     /// structure at confirm time (issue #22). Rebuilt by `set_sample_rate`
     /// so its bin-width math matches the real device rate.
     partial_analyzer: PartialAnalyzer,
+    /// Set once the user has been warned that the note's last reading is
+    /// outside tolerance (issue #81). The next confirm press saves it; the
+    /// flag is cleared whenever the note or step changes, so a fresh reading
+    /// is judged on its own.
+    out_of_tolerance_confirmed: bool,
 }
 
 impl App {
@@ -138,6 +143,7 @@ impl App {
             help: HelpOverlay::new(),
             sample_rate: Self::DEFAULT_SAMPLE_RATE,
             partial_analyzer: PartialAnalyzer::new(Self::DEFAULT_SAMPLE_RATE),
+            out_of_tolerance_confirmed: false,
         }
     }
 
@@ -319,6 +325,11 @@ impl App {
     /// the same reading rather than a rejected one.
     const PROFILING_CONFIDENCE_FLOOR: f32 = 0.6;
 
+    /// How long the "confirm again" warning for an out-of-tolerance reading
+    /// stays on the status line (issue #81). Long enough to read, short
+    /// enough that it can't be mistaken for the state of a later note.
+    const OUT_OF_TOLERANCE_WARNING_TTL: Duration = Duration::from_secs(5);
+
     /// Capture the partial spectrum backing the current profiling reading
     /// (issue #22): analyzes `samples` (the raw audio window that produced
     /// `freq`) so confirming the note can persist `Vec<Partial>` alongside
@@ -381,9 +392,20 @@ impl App {
         self.flow.as_mut().map(TuningFlow::session_mut)
     }
 
-    /// Get target frequency for current note.
+    /// Get target frequency for current note, or `None` when the current
+    /// screen has no note to target (mode select, calibration, complete).
+    ///
+    /// Profiling is included (issue #83): without a target the pitch worker
+    /// falls back to full-range `detect()`, which can't read the bottom
+    /// octave at all and locks onto octaves higher up - exactly what
+    /// profiling must not do, since its whole job is measuring how far off
+    /// pitch each key is.
     pub fn current_target_freq(&self) -> Option<f32> {
-        self.tuning.as_ref().map(|t| t.target_freq())
+        match self.state {
+            AppState::Tuning => self.tuning.as_ref().map(|t| t.target_freq()),
+            AppState::Profiling => self.profiling.as_ref().map(|p| p.target_freq()),
+            _ => None,
+        }
     }
 
     /// The muting-step level/VU indicator's current level, if a tuning
@@ -525,13 +547,30 @@ impl App {
         match key {
             KeyCode::Char(' ') => {
                 // Confirm current note (no-op without a pitch reading)
-                if let Some(profiling) = &mut self.profiling {
-                    if profiling.confirm_note() {
-                        self.finish_profiling();
-                    } else {
-                        self.sync_profiling_target();
-                    }
+                let before = self
+                    .profiling
+                    .as_ref()
+                    .map(ProfilingScreen::current_note_idx);
+                let complete = match &mut self.profiling {
+                    Some(profiling) => profiling.confirm_note(),
+                    None => return,
+                };
+                if complete {
+                    self.finish_profiling();
+                    return;
                 }
+                // Autosave the partial profile (issue #87), but only when a
+                // measurement was actually recorded: a silent confirm leaves
+                // the profile unchanged.
+                let advanced = self
+                    .profiling
+                    .as_ref()
+                    .map(ProfilingScreen::current_note_idx)
+                    != before;
+                if advanced {
+                    self.autosave_profile();
+                }
+                self.sync_profiling_target();
             }
             KeyCode::Char('b') | KeyCode::Char('B') => {
                 // Go back to previous note
@@ -542,18 +581,50 @@ impl App {
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 // Skip current note
-                if let Some(profiling) = &mut self.profiling {
-                    if profiling.skip_note() {
-                        self.finish_profiling();
-                    } else {
-                        self.sync_profiling_target();
-                    }
+                let complete = match &mut self.profiling {
+                    Some(profiling) => profiling.skip_note(),
+                    None => return,
+                };
+                if complete {
+                    self.finish_profiling();
+                    return;
                 }
+                // Issue #87: a skip is progress too - what was measured so
+                // far must survive a mid-keyboard quit.
+                self.autosave_profile();
+                self.sync_profiling_target();
             }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
                 self.quit();
             }
             _ => {}
+        }
+    }
+
+    /// Write the in-progress partial profile to disk (issue #87) so quitting
+    /// mid-keyboard keeps every measurement taken so far; the note's `None`
+    /// holes are simply keys not visited yet. Failures are parked in
+    /// `save_error` for the status line, like `finish_profiling`'s.
+    fn autosave_profile(&mut self) {
+        // NOTE: unit tests drive the profiling screen in-memory; don't write
+        // to the user's real data dir from the test suite (same guard as
+        // `autosave_session`).
+        if cfg!(test) {
+            return;
+        }
+        let result = match &self.profiling {
+            Some(profiling) => profiling.profile().save(),
+            None => return,
+        };
+        match result {
+            Ok(()) => self.status.clear(StatusId::SaveError),
+            Err(e) => self.status.upsert(
+                StatusId::SaveError,
+                format!("Failed to save profile: {}", e),
+                Severity::Warning,
+                None,
+                Instant::now(),
+            ),
         }
     }
 
@@ -752,14 +823,46 @@ impl App {
 
         // For multi-string notes (bichord/trichord), advance through steps
         if tuning.is_multi_string() && tuning.next_step() {
-            // New step, new strike: re-arm the lock beep
+            // New step, new strike: re-arm the lock beep, and judge the new
+            // string's reading on its own (issue #81)
+            self.out_of_tolerance_confirmed = false;
             if let Some(flow) = &mut self.flow {
                 flow.rearm_beep_latch();
             }
             return;
         }
 
-        let cents = tuning.cents();
+        // Issue #80: save the last confident reading of the strike, not the
+        // live value `clear()` resets to 0.0 once the note decays. With no
+        // reading at all there is nothing to save, so refuse to move on and
+        // record a hole (mirroring `ProfilingScreen::confirm_note`).
+        let Some(cents) = self
+            .tuning
+            .as_ref()
+            .and_then(|tuning| tuning.last_confident_cents())
+        else {
+            return;
+        };
+
+        // Issue #81: a reading this far out is not confirmed by one keypress -
+        // warn first, and let the second press save the real value.
+        if cents.abs() > self.tolerance && !self.out_of_tolerance_confirmed {
+            self.out_of_tolerance_confirmed = true;
+            self.status.upsert(
+                StatusId::OutOfTolerance,
+                format!(
+                    "{:+.1} cents off target - press Space again to confirm",
+                    cents
+                ),
+                Severity::Warning,
+                Some(Self::OUT_OF_TOLERANCE_WARNING_TTL),
+                Instant::now(),
+            );
+            return;
+        }
+        self.out_of_tolerance_confirmed = false;
+        self.status.clear(StatusId::OutOfTolerance);
+
         let finished = self
             .flow
             .as_mut()
@@ -772,6 +875,9 @@ impl App {
         // Try to go to previous step first
         if let Some(tuning) = &mut self.tuning {
             if tuning.prev_step() {
+                // Back on the previous string: judge its reading afresh
+                // (issue #81)
+                self.out_of_tolerance_confirmed = false;
                 if let Some(flow) = &mut self.flow {
                     flow.rearm_beep_latch();
                 }
@@ -786,6 +892,7 @@ impl App {
             .map(|flow| flow.go_back_note())
             .unwrap_or(false);
         if went_back {
+            self.out_of_tolerance_confirmed = false;
             self.autosave_session();
             self.setup_current_note();
 
@@ -812,6 +919,8 @@ impl App {
         let Some(finished) = finished else {
             return;
         };
+        // A new note is judged on its own reading (issue #81)
+        self.out_of_tolerance_confirmed = false;
         // Persist progress, including the final advance to 88, so a
         // finished session is stored complete and --resume doesn't reopen
         // it.
@@ -873,6 +982,7 @@ impl App {
         self.status.clear(StatusId::SaveError);
         self.status.clear(StatusId::ResumeWarning);
         self.beep_pending = false;
+        self.out_of_tolerance_confirmed = false;
         // NOTE: tolerance and beep_enabled are config-scoped and survive
         // reset, like configured_a4.
         // NOTE: AudioWarning and SilenceWatchdog are deliberately kept
@@ -972,10 +1082,15 @@ mod tests {
         app
     }
 
-    /// Confirm through all steps of the current note until it's recorded.
+    /// Confirm through all steps of the current note until it's recorded,
+    /// feeding an in-tolerance reading before each press (a confirm with no
+    /// reading at all is a no-op, and one outside tolerance takes two
+    /// presses - see issues #80/#81).
     fn confirm_note_fully(app: &mut App) {
         let before = app.flow.as_ref().unwrap().session().completed_notes.len();
         while app.flow.as_ref().unwrap().session().completed_notes.len() == before {
+            let target = app.current_target_freq().unwrap();
+            app.update_pitch(target, 0.9);
             app.confirm_note();
         }
     }
@@ -1066,6 +1181,128 @@ mod tests {
             app.flow.as_ref().unwrap().session().completed_notes.len(),
             1,
             "re-confirm must not create a duplicate entry"
+        );
+    }
+
+    // -- saving the strike that was actually played (issues #80/#81) -------
+
+    /// Config-driven app in Tuning state, advanced past the first note's mute
+    /// step so the meter is live. Same as `beeping_app`, with the beep off.
+    fn live_tuning_app(tolerance: f32) -> App {
+        let config = EffectiveConfig {
+            tolerance,
+            ..test_config(440.0)
+        };
+        let mut app = App::with_config(&config); // ConcertPitch preselected
+        app.start_session();
+        assert_eq!(app.state(), AppState::Tuning);
+        app.handle_key(KeyCode::Char(' ')); // past the bichord mute step
+        app
+    }
+
+    #[test]
+    fn test_confirm_after_silence_saves_the_pre_silence_reading() {
+        // Issue #80: the note decays, `clear_pitch` resets the live value to
+        // 0.0, and Space then saved a flawless 0.0 for a note that was never
+        // in tune. The strike's last confident reading is what gets recorded.
+        let mut app = live_tuning_app(5.0);
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(sharp(target, 4.0), 0.9);
+        app.clear_pitch(); // the string decays: the normal thing before Space
+
+        app.handle_key(KeyCode::Char(' '));
+
+        let completed = &app.flow.as_ref().unwrap().session().completed_notes;
+        assert_eq!(completed.len(), 1, "the note must still be confirmed");
+        assert!(
+            (completed[0].final_cents - 4.0).abs() < 0.5,
+            "expected the pre-silence reading, got {}",
+            completed[0].final_cents
+        );
+    }
+
+    #[test]
+    fn test_confirm_without_any_reading_records_nothing() {
+        // Issue #80: with no reading at all there is no measurement to save;
+        // advancing anyway would file the note as tuned.
+        let mut app = live_tuning_app(5.0);
+        app.handle_key(KeyCode::Char(' '));
+
+        let session = app.flow.as_ref().unwrap().session();
+        assert!(session.completed_notes.is_empty(), "nothing to save");
+        assert_eq!(session.current_note_index, 0, "must not advance");
+    }
+
+    #[test]
+    fn test_confirm_outside_tolerance_needs_a_second_press() {
+        // Issue #81: a note was confirmed at +60.9 cents with nothing flagging
+        // it. The first press warns; the second saves the real value.
+        let mut app = live_tuning_app(5.0);
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(sharp(target, 60.9), 0.9);
+
+        app.handle_key(KeyCode::Char(' '));
+        let session = app.flow.as_ref().unwrap().session();
+        assert!(
+            session.completed_notes.is_empty(),
+            "the first press must not save"
+        );
+        assert_eq!(session.current_note_index, 0, "nor advance");
+        assert!(
+            app.status.text_for(StatusId::OutOfTolerance).is_some(),
+            "the out-of-tolerance reading must be flagged"
+        );
+
+        app.handle_key(KeyCode::Char(' '));
+        let completed = &app.flow.as_ref().unwrap().session().completed_notes;
+        assert_eq!(completed.len(), 1, "the second press confirms");
+        assert!(
+            (completed[0].final_cents - 60.9).abs() < 0.5,
+            "the real value must be saved, not clamped: {}",
+            completed[0].final_cents
+        );
+        assert!(
+            app.status.text_for(StatusId::OutOfTolerance).is_none(),
+            "the warning goes away once the note is confirmed"
+        );
+    }
+
+    #[test]
+    fn test_out_of_tolerance_warning_does_not_block_an_in_tune_reading() {
+        // The arming belongs to the reading it warned about, not to the note:
+        // once the string is pulled inside tolerance, one press confirms.
+        let mut app = live_tuning_app(5.0);
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(sharp(target, 60.0), 0.9);
+        app.handle_key(KeyCode::Char(' ')); // warns
+
+        app.update_pitch(sharp(target, 2.0), 0.9);
+        app.handle_key(KeyCode::Char(' '));
+
+        let completed = &app.flow.as_ref().unwrap().session().completed_notes;
+        assert_eq!(completed.len(), 1);
+        assert!((completed[0].final_cents - 2.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn test_out_of_tolerance_arming_resets_for_the_next_note() {
+        // A warning about one note must not let the next note through on a
+        // single press.
+        let mut app = live_tuning_app(5.0);
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(sharp(target, 60.0), 0.9);
+        app.handle_key(KeyCode::Char(' ')); // warns
+        app.handle_key(KeyCode::Char(' ')); // confirms: F3 done
+
+        app.handle_key(KeyCode::Char(' ')); // next note, past its mute step
+        let target = app.current_target_freq().unwrap();
+        app.update_pitch(sharp(target, 60.0), 0.9);
+        app.handle_key(KeyCode::Char(' ')); // must warn, not save
+
+        assert_eq!(
+            app.flow.as_ref().unwrap().session().completed_notes.len(),
+            1,
+            "the next note needs its own warning first"
         );
     }
 
@@ -1210,6 +1447,46 @@ mod tests {
         assert_eq!(
             app.stretch.as_ref().unwrap().offset_cents(21),
             StretchCurve::railsback_default().offset_cents(21)
+        );
+    }
+
+    #[test]
+    fn test_partial_profile_still_fits_a_stretch_curve() {
+        // Issue #87: a profile autosaved partway through the keyboard has
+        // fewer than 88 notes filled in, and must still be usable by
+        // `--stretch profile` - fitted from what was measured, not dropped.
+        let config = EffectiveConfig {
+            stretch: StretchMode::Profile,
+            ..test_config(440.0)
+        };
+        let mut app = App::with_config(&config);
+
+        let mut partial = PianoProfile::new();
+        for midi in [33u8, 45, 57, 69, 81] {
+            let f0 = 440.0 * 2f32.powf((midi as f32 - 69.0) / 12.0);
+            let b = 0.0002 + 0.0006 * ((midi as f32 - 69.0) / 39.0).powi(2);
+            let partials: Vec<crate::audio::Partial> = (1..=6u16)
+                .map(|n| {
+                    let nf = n as f32;
+                    crate::audio::Partial {
+                        n,
+                        freq_hz: nf * f0 * (1.0 + b * nf * nf).sqrt(),
+                        amplitude: 1.0 / nf,
+                    }
+                })
+                .collect();
+            partial.record_note_full(midi, f0, 0.0, f0, 0.9, partials);
+        }
+        assert!(!partial.is_complete(), "fixture must be a partial profile");
+
+        app.profile = Some(partial);
+        app.recompute_stretch();
+
+        let stretch = app.stretch.as_ref().expect("profile stretch resolves");
+        assert_ne!(
+            stretch.offset_cents(21),
+            StretchCurve::railsback_default().offset_cents(21),
+            "the measured keys must drive the curve, not the Railsback fallback"
         );
     }
 
@@ -1522,6 +1799,52 @@ mod tests {
         assert!((profiling.target_freq() - expected).abs() < f32::EPSILON);
     }
 
+    #[test]
+    fn test_current_target_freq_is_set_during_profiling() {
+        // Issue #83: profiling used to leave this `None`, so the worker fell
+        // back to full-range `detect()` - no bottom octave at all, and octave
+        // errors up the keyboard - instead of guided detection on the note
+        // being measured.
+        let mut app = App::with_config(&test_config(440.0));
+        app.mode_select.select(SelectedMode::Profile);
+        app.start_session();
+        assert_eq!(app.state(), AppState::Profiling);
+
+        let target = app
+            .current_target_freq()
+            .expect("profiling must target the note it is measuring");
+        let expected = app.target_for_midi(app.profiling.as_ref().unwrap().current_note().midi);
+        assert!((target - expected).abs() < f32::EPSILON);
+
+        // Skipping advances the note; the worker's target must follow.
+        app.handle_key(KeyCode::Char('s'));
+        let next = app.current_target_freq().expect("target follows the note");
+        let expected = app.target_for_midi(app.profiling.as_ref().unwrap().current_note().midi);
+        assert!((next - expected).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_profiling_records_a_note_that_is_far_off_pitch() {
+        // Issue #83's companion check: measuring how far off each key is is
+        // the profile's whole purpose, so a badly out-of-tune reading must
+        // still be recorded rather than rejected.
+        let mut app = profiling_app();
+        let target = app.profiling.as_ref().unwrap().target_freq();
+        let freq = sharp(target, 60.0);
+
+        app.update_pitch(freq, 0.9);
+        app.handle_key(KeyCode::Char(' '));
+
+        let recorded = app.profiling.as_ref().unwrap().profile().notes[0]
+            .as_ref()
+            .expect("A0 recorded");
+        assert!(
+            (recorded.cents - 60.0).abs() < 0.5,
+            "the deviation is the point: {}",
+            recorded.cents
+        );
+    }
+
     // ---- Partial spectra capture during profiling (issue #22) -------------
 
     const TEST_SAMPLE_RATE: u32 = 44_100;
@@ -1583,6 +1906,53 @@ mod tests {
 
         let profiling = app.profiling.as_ref().unwrap();
         assert!(profiling.current_partials().is_empty());
+    }
+
+    #[test]
+    fn test_capture_profiling_partials_accumulates_across_frames() {
+        // Issue #86: two frames of one strike must both reach the recorded
+        // set, instead of the second overwriting the first.
+        let mut app = profiling_app();
+        let f0 = 27.5;
+        let b = 0.009;
+        let first = TestAudioSource::inharmonic(
+            f0,
+            b,
+            &[(1, 0.05), (2, 1.0), (3, 0.9)],
+            0.3,
+            TEST_SAMPLE_RATE,
+        );
+        let second = TestAudioSource::inharmonic(
+            f0,
+            b,
+            &[(1, 0.06), (2, 0.95), (3, 0.85)],
+            0.3,
+            TEST_SAMPLE_RATE,
+        );
+
+        app.capture_profiling_partials(f0, 0.9, first.samples());
+        app.capture_profiling_partials(f0, 0.9, second.samples());
+
+        let analyzer = PartialAnalyzer::new(TEST_SAMPLE_RATE);
+        let expected_first = analyzer.analyze(first.samples(), f0);
+        let expected_second = analyzer.analyze(second.samples(), f0);
+        assert!(
+            !expected_first.is_empty() && !expected_second.is_empty(),
+            "fixtures must yield partials"
+        );
+
+        let captured = app.profiling.as_ref().unwrap().current_partials();
+        assert!(!captured.is_empty());
+        assert_ne!(
+            captured,
+            expected_first.as_slice(),
+            "the first frame's capture must not be discarded"
+        );
+        assert_ne!(
+            captured,
+            expected_second.as_slice(),
+            "the last frame must not simply overwrite the earlier ones"
+        );
     }
 
     #[test]
