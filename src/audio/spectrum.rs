@@ -157,10 +157,10 @@ impl PartialAnalyzer {
     /// which is *not* the true f0, just close enough to look plausible (the
     /// "naive GCD is biased sharp" the issue calls out). This instead:
     ///
-    /// 1. Grid-searches candidate `(f0, B)` pairs within +/-100 cents of
-    ///    `target_hz` (a guided note may itself be mistuned) against the raw
-    ///    magnitude spectrum, scoring how much partial-2..6 energy each pair
-    ///    explains.
+    /// 1. Grid-searches candidate `(f0, B)` pairs within +/-200 cents of
+    ///    `target_hz` (a guided note may itself be mistuned, and a neglected
+    ///    piano's bass can sag a whole semitone) against the raw magnitude
+    ///    spectrum, scoring how much partial-2..6 energy each pair explains.
     /// 2. Re-locates those partials to sub-bin precision at the winning
     ///    candidate, so the refine step's search band is centered by the
     ///    *inharmonic* prediction rather than a naive harmonic one.
@@ -169,7 +169,8 @@ impl PartialAnalyzer {
     ///
     /// Returns `None` when fewer than two partials are located (an ill-posed
     /// fit), the fit lands implausibly far from `target_hz` (a wrong note or
-    /// pure noise), or `target_hz` is non-positive.
+    /// pure noise), a fit beyond the adjacent semitone lacks strong partial
+    /// evidence (the ambiguity guard below), or `target_hz` is non-positive.
     pub fn estimate_bass_f0(&self, samples: &[f32], target_hz: f32) -> Option<BassF0Estimate> {
         if target_hz <= 0.0 {
             return None;
@@ -206,10 +207,24 @@ impl PartialAnalyzer {
             return None;
         }
 
+        let confidence = partial_match_confidence(&matched, f0_fit, b_fit);
+
+        // Adjacent-semitone ambiguity guard (issue #84): the widened +/-200 c
+        // band now overlaps the neighboring semitone, so a fit that lands
+        // beyond +/-100 c of the target — closer to a neighbor than to the note
+        // being tuned — must clear a higher bar than the downstream
+        // acceptance floor (0.5) before being reported. A genuinely
+        // semitone-flat string still passes comfortably.
+        if cents_from_target.abs() > BASS_ADJACENT_SEMITONE_CENTS
+            && !far_fit_evidence_sufficient(matched.len(), confidence)
+        {
+            return None;
+        }
+
         Some(BassF0Estimate {
             frequency: f0_fit,
             inharmonicity_b: b_fit,
-            confidence: partial_match_confidence(&matched, f0_fit, b_fit),
+            confidence,
             partials_matched: matched.len() as u16,
         })
     }
@@ -364,15 +379,17 @@ fn parabolic_peak(m0: f32, m1: f32, m2: f32) -> (f32, f32) {
 // then least-squares refit from the located partials.
 
 /// Cents to either side of the guided target searched for the true (possibly
-/// mistuned) string pitch (issue #15: "+/-100 cents of target").
-const BASS_SEARCH_CENTS: f32 = 100.0;
+/// mistuned) string pitch. Issue #15 searched +/-100 c; issue #84 widened it
+/// to +/-200 c because a neglected piano's bass strings sag ~a semitone
+/// (~-100 to -123 c), so the true pitch sat at the old band's edge or beyond.
+const BASS_SEARCH_CENTS: f32 = 200.0;
 
-/// Candidate f0 grid resolution across the +/-100-cent search band (~5-cent
+/// Candidate f0 grid resolution across the +/-200-cent search band (~5-cent
 /// steps). The coarse grid only needs to land close enough that
 /// [`PartialAnalyzer::locate_partials`]'s own search radius (a fraction of the
 /// partial spacing) recovers the true peaks in the refine pass — it does not
 /// need to be the final answer.
-const BASS_F0_GRID_STEPS: usize = 41;
+const BASS_F0_GRID_STEPS: usize = 81;
 
 /// Candidate inharmonicity values tried during the coarse grid search,
 /// spanning the physically observed bass range (issue #17's fixture
@@ -396,6 +413,33 @@ const BASS_MATCH_MAX_PARTIAL: u16 = 6;
 /// value), so the rejection gate needs a little more room than the search
 /// band itself, or a good fit near the band's edge would be discarded.
 const BASS_FIT_DRIFT_MARGIN_CENTS: f32 = 20.0;
+
+/// Adjacent-semitone ambiguity threshold (issue #84). A fit closer than this
+/// to the target is accepted on the normal evidence; one beyond it is nearer
+/// the neighboring semitone than the note being tuned, so it must clear
+/// [`BASS_FAR_FIT_MIN_PARTIALS`] / [`BASS_FAR_FIT_MIN_CONFIDENCE`] first. The
+/// exact semitone span is 100 c, so the guard fires only for fits past a
+/// clean semitone — a real ~-120 c sag is still accepted, but a spurious
+/// partial-family fit at the band edge is not.
+const BASS_ADJACENT_SEMITONE_CENTS: f32 = 100.0;
+
+/// Minimum located partials a fit beyond [`BASS_ADJACENT_SEMITONE_CENTS`] must
+/// be built from. Two partials pin a line through `(n^2, (f_n/n)^2)` with no
+/// redundancy, so a far fit from a pair is as likely a coincidental alignment
+/// as a real string.
+const BASS_FAR_FIT_MIN_PARTIALS: usize = 3;
+
+/// Minimum match confidence for a fit beyond [`BASS_ADJACENT_SEMITONE_CENTS`].
+/// Sits clearly above the downstream acceptance floor (`0.5`); a genuine bass
+/// string resolves to ~1.0 here, while an accidental partial alignment at the
+/// band edge does not.
+const BASS_FAR_FIT_MIN_CONFIDENCE: f32 = 0.7;
+
+/// Evidence gate for a fit that landed beyond [`BASS_ADJACENT_SEMITONE_CENTS`]
+/// of the target (issue #84's adjacent-semitone ambiguity guard).
+fn far_fit_evidence_sufficient(partials_matched: usize, confidence: f32) -> bool {
+    partials_matched >= BASS_FAR_FIT_MIN_PARTIALS && confidence >= BASS_FAR_FIT_MIN_CONFIDENCE
+}
 
 /// Confidence floor: an RMS partial-match residual at or above this many
 /// cents scores 0. A clean fit resolves to a couple of cents; a mismatch
@@ -805,6 +849,94 @@ mod tests {
             err < 5.0,
             "expected within 5 cents of the true {true_f0} Hz, got {} ({err:.2}c)",
             estimate.frequency
+        );
+    }
+
+    #[test]
+    fn estimate_bass_f0_detects_note_120_cents_flat() {
+        // Issue #84 field regression: a neglected spinet's bass sags ~a
+        // semitone (measured -91 to -123 cents). The old +/-100 c search
+        // rejected past its 120 c gate; the widened +/-200 c band must
+        // resolve the true pitch AND the adjacent-semitone guard must not
+        // discard it. -123 c is the field truth for C#1, just past the old
+        // gate, so this fails on the pre-#84 constants.
+        let flat_cents = 123.0;
+        let true_f0 = 41.2; // E1
+        let b = 0.0005;
+        let src = TestAudioSource::inharmonic(
+            true_f0,
+            b,
+            &[(2, 1.0), (3, 0.8), (4, 0.7), (5, 0.5), (6, 0.4)],
+            0.4,
+            SR,
+        );
+        // Guide the tuner to the equal-tempered pitch the string sagged from.
+        let target_hz = true_f0 * 2f32.powf(flat_cents / 1200.0);
+        let estimate = PartialAnalyzer::new(SR)
+            .estimate_bass_f0(src.samples(), target_hz)
+            .expect("a ~120-cent-flat bass note must still resolve");
+        let err = cents(estimate.frequency, true_f0).abs();
+        assert!(
+            err < 5.0,
+            "expected within 5 cents of the true {true_f0} Hz, got {} ({err:.2}c)",
+            estimate.frequency
+        );
+        // It really did land in the far-fit half of the band, i.e. the guard
+        // branch above ran and let a legitimate sag through.
+        assert!(
+            cents(estimate.frequency, target_hz) < -BASS_ADJACENT_SEMITONE_CENTS,
+            "expected a fit past the adjacent semitone, got {:.2}c from target",
+            cents(estimate.frequency, target_hz)
+        );
+    }
+
+    #[test]
+    fn estimate_bass_f0_still_detects_note_near_target() {
+        // Widening the search must not cost accuracy on a well-tuned string.
+        let true_f0 = 41.2; // E1
+        let b = 0.0005;
+        let src = TestAudioSource::inharmonic(
+            true_f0,
+            b,
+            &[(2, 1.0), (3, 0.8), (4, 0.7), (5, 0.5), (6, 0.4)],
+            0.4,
+            SR,
+        );
+        let estimate = PartialAnalyzer::new(SR)
+            .estimate_bass_f0(src.samples(), true_f0)
+            .expect("an on-pitch bass note must resolve");
+        let err = cents(estimate.frequency, true_f0).abs();
+        assert!(
+            err < 3.0,
+            "expected within 3 cents of {true_f0} Hz, got {} ({err:.2}c)",
+            estimate.frequency
+        );
+    }
+
+    #[test]
+    fn far_fit_evidence_guard_requires_strong_evidence() {
+        // The guard's decision table (issue #84): a far fit needs >= 3
+        // partials and a confidence clearly above the downstream 0.5 floor.
+        assert!(far_fit_evidence_sufficient(5, 0.95));
+        assert!(far_fit_evidence_sufficient(3, 0.7));
+        assert!(!far_fit_evidence_sufficient(2, 0.95)); // too few partials
+        assert!(!far_fit_evidence_sufficient(5, 0.5)); // no better than the floor
+    }
+
+    #[test]
+    fn estimate_bass_f0_rejects_far_fit_without_strong_evidence() {
+        // Adjacent-semitone guard (issue #84): the widened band must not turn
+        // sparse evidence far from the target into an accepted reading. Only
+        // two partials exist, so a fit past the semitone cannot clear the
+        // >= 3 partial bar and is rejected.
+        let true_f0 = 41.2; // E1
+        let src = TestAudioSource::inharmonic(true_f0, 0.0, &[(2, 1.0), (3, 0.8)], 0.4, SR);
+        let target_hz = true_f0 * 2f32.powf(140.0 / 1200.0); // string ~140c flat
+        assert!(
+            PartialAnalyzer::new(SR)
+                .estimate_bass_f0(src.samples(), target_hz)
+                .is_none(),
+            "a far fit from only two partials must be rejected"
         );
     }
 
