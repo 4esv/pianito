@@ -235,6 +235,13 @@ pub struct TuningScreen {
     detected_freq: Option<f32>,
     /// Cents deviation from target.
     cents_deviation: f32,
+    /// Cents deviation of the last confident reading, kept across
+    /// [`Self::clear`] (issue #80). `clear` resets `cents_deviation` to 0.0
+    /// the moment the note decays, so confirming afterwards used to save a
+    /// perfect 0.0 for whatever the string was actually tuned to; this field
+    /// remembers the strike instead. `None` until the first reading of this
+    /// note arrives (`App` builds a fresh screen per note).
+    last_cents: Option<f32>,
     /// Number of strings for this note.
     string_count: u8,
     /// Current tuning step (for multi-string notes).
@@ -297,6 +304,7 @@ impl TuningScreen {
             target_freq,
             detected_freq: None,
             cents_deviation: 0.0,
+            last_cents: None,
             string_count,
             tuning_step,
             phase_name,
@@ -350,9 +358,13 @@ impl TuningScreen {
     pub fn update(&mut self, freq: f32, cents: f32) {
         self.detected_freq = Some(freq);
         self.cents_deviation = cents;
+        self.last_cents = Some(cents);
     }
 
     /// Clear detected pitch (silence/no detection).
+    ///
+    /// Deliberately does NOT forget [`Self::last_confident_cents`]: the note
+    /// decaying is not the same thing as the reading being wrong (issue #80).
     pub fn clear(&mut self) {
         self.detected_freq = None;
         self.cents_deviation = 0.0;
@@ -362,6 +374,14 @@ impl TuningScreen {
     /// Get current cents deviation.
     pub fn cents(&self) -> f32 {
         self.cents_deviation
+    }
+
+    /// The last confident reading's cents deviation, which survives
+    /// [`Self::clear`] (issue #80): what a confirm press must save, and what
+    /// the out-of-tolerance check (issue #81) must judge. `None` before this
+    /// note's first reading — there is then nothing to save.
+    pub fn last_confident_cents(&self) -> Option<f32> {
+        self.last_cents
     }
 
     /// Set the level shown by the muting-step VU indicator (issue #32
@@ -995,6 +1015,34 @@ mod tests {
         screen.set_mute_level(0.8);
         screen.clear();
         assert_eq!(screen.mute_level(), 0.0);
+    }
+
+    // -- last confident reading (issue #80) --
+
+    #[test]
+    fn test_last_confident_cents_is_none_before_any_reading() {
+        let screen = monochord_screen();
+        assert_eq!(screen.last_confident_cents(), None);
+    }
+
+    #[test]
+    fn test_last_confident_cents_survives_clear() {
+        // Issue #80: silence must not erase the strike's reading - confirming
+        // after the note decays is the normal thing to do.
+        let mut screen = monochord_screen();
+        screen.update(27.63, 8.0);
+        screen.clear();
+
+        assert_eq!(screen.cents(), 0.0, "the live value still resets");
+        assert_eq!(screen.last_confident_cents(), Some(8.0));
+    }
+
+    #[test]
+    fn test_last_confident_cents_follows_the_latest_reading() {
+        let mut screen = monochord_screen();
+        screen.update(27.55, 3.0);
+        screen.update(27.63, 8.0);
+        assert_eq!(screen.last_confident_cents(), Some(8.0));
     }
 
     #[test]
