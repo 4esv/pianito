@@ -102,7 +102,8 @@ const RIGHT_COLUMN: &[(&str, &[(&str, &str)])] = &[
 
 /// CLI flags aren't keybindings, but the issue calls out that they belong
 /// on the same reference surface as the mode-dependent keys.
-const CLI_FLAGS: &str = "CLI flags (see --help): --a4 <hz>, --beep, --quick, --resume. \
+const CLI_FLAGS: &str =
+    "CLI flags (see --help): --a4 <hz>, --beep, --quick, --profile, --menu, --resume. \
     Subcommands: analyze, reference, history, reset.";
 
 impl Widget for &HelpOverlay {

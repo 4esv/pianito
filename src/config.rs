@@ -20,9 +20,18 @@ pub struct Args {
     #[arg(long)]
     pub resume: bool,
 
-    /// Start with Quick Tune preselected (tune relative to current pitch center).
+    /// Start in Quick Tune (calibrate to the piano's current pitch center,
+    /// then tune).
     #[arg(long)]
     pub quick: bool,
+
+    /// Start in Profile mode (measure the piano before tuning).
+    #[arg(long)]
+    pub profile: bool,
+
+    /// Show the mode-select menu instead of auto-starting the default mode.
+    #[arg(long)]
+    pub menu: bool,
 
     /// Custom A4 reference frequency in Hz.
     #[arg(long)]
@@ -173,6 +182,8 @@ impl Config {
             tolerance: self.tolerance,
             beep: args.beep || self.beep,
             quick_mode: args.quick || self.default_mode == "quick",
+            profile_mode: args.profile,
+            show_menu: args.menu,
             resume: args.resume,
             stretch: args.stretch.unwrap_or(self.stretch),
         }
@@ -190,6 +201,10 @@ pub struct EffectiveConfig {
     pub beep: bool,
     /// Use quick tune mode.
     pub quick_mode: bool,
+    /// Start in Profile mode.
+    pub profile_mode: bool,
+    /// Show the mode-select menu instead of auto-starting the default mode.
+    pub show_menu: bool,
     /// Resume previous session.
     pub resume: bool,
     /// How stretch is applied to tuning targets.
@@ -228,6 +243,8 @@ mod tests {
             a4: None,
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
 
@@ -248,6 +265,8 @@ mod tests {
             a4: Some(442.0),
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert_eq!(effective.a4, 442.0);
@@ -263,6 +282,8 @@ mod tests {
             a4: None,
             beep: true,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.beep);
@@ -278,6 +299,8 @@ mod tests {
             a4: None,
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.quick_mode);
@@ -296,6 +319,8 @@ mod tests {
             a4: None,
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.quick_mode);
@@ -311,9 +336,29 @@ mod tests {
             a4: None,
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.resume);
+    }
+
+    #[test]
+    fn test_merge_with_args_profile_and_menu_flags() {
+        let config = Config::default();
+        let args = Args {
+            command: None,
+            resume: false,
+            quick: false,
+            profile: true,
+            menu: true,
+            a4: None,
+            beep: false,
+            stretch: None,
+        };
+        let effective = config.merge_with_args(&args);
+        assert!(effective.profile_mode);
+        assert!(effective.show_menu);
     }
 
     #[test]
@@ -329,6 +374,8 @@ mod tests {
             a4: None,
             beep: false,
             stretch: None,
+            menu: false,
+            profile: false,
         };
         let effective = config.merge_with_args(&args);
         assert!(effective.beep); // Config beep is true
@@ -438,6 +485,8 @@ mod tests {
             a4,
             beep,
             stretch: None,
+            menu: false,
+            profile: false,
         }
     }
 

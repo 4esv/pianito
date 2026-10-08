@@ -155,7 +155,9 @@ impl App {
         app.configured_a4 = config.a4;
         app.tolerance = config.tolerance;
         app.beep_enabled = config.beep;
-        app.default_mode = if config.quick_mode {
+        app.default_mode = if config.profile_mode {
+            SelectedMode::Profile
+        } else if config.quick_mode {
             SelectedMode::QuickTune
         } else {
             SelectedMode::ConcertPitch
@@ -509,6 +511,16 @@ impl App {
                 self.quit();
             }
             _ => {}
+        }
+    }
+
+    /// Begin the default session immediately, skipping the mode-select menu
+    /// (one-command quick start). No-op unless the app is still at the menu,
+    /// so `--resume` (already in Tuning) and any later reset to the menu are
+    /// unaffected. `--menu` opts back into the menu by never calling this.
+    pub fn auto_start(&mut self) {
+        if self.state == AppState::ModeSelect {
+            self.start_session();
         }
     }
 
@@ -1067,6 +1079,8 @@ mod tests {
             tolerance: 5.0,
             beep: false,
             quick_mode: false,
+            profile_mode: false,
+            show_menu: false,
             resume: false,
             stretch: StretchMode::Railsback,
         }
@@ -1093,6 +1107,33 @@ mod tests {
             app.update_pitch(target, 0.9);
             app.confirm_note();
         }
+    }
+
+    #[test]
+    fn test_auto_start_skips_the_menu_into_the_default_mode() {
+        let mut app = App::with_config(&test_config(440.0));
+        assert_eq!(app.state(), AppState::ModeSelect);
+        app.auto_start();
+        assert_eq!(app.state(), AppState::Tuning);
+    }
+
+    #[test]
+    fn test_auto_start_is_a_noop_when_not_at_the_menu() {
+        let mut app = concert_app(); // already in Tuning
+        app.auto_start();
+        assert_eq!(app.state(), AppState::Tuning);
+    }
+
+    #[test]
+    fn test_profile_mode_flag_selects_profile_and_auto_starts() {
+        let config = EffectiveConfig {
+            profile_mode: true,
+            ..test_config(440.0)
+        };
+        let mut app = App::with_config(&config);
+        assert_eq!(app.mode_select.selected(), SelectedMode::Profile);
+        app.auto_start();
+        assert_eq!(app.state(), AppState::Profiling);
     }
 
     #[test]

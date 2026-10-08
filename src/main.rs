@@ -250,6 +250,14 @@ fn run_interactive(config: pianito::config::EffectiveConfig) -> anyhow::Result<(
     // the real device rate, not the `App::new` placeholder.
     app.set_sample_rate(sample_rate);
 
+    // One-command quick start: begin the default session immediately instead
+    // of showing the mode-select menu, unless the user asked for the menu
+    // (`--menu`). `auto_start` no-ops when a `--resume` session is already
+    // in Tuning.
+    if !config.show_menu {
+        app.auto_start();
+    }
+
     // Audio output for the lock beep (config/--beep). Opened before the TUI
     // so a missing output device degrades to a status-line warning instead
     // of failing mid-session.
