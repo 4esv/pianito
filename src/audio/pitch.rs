@@ -247,6 +247,15 @@ impl PitchDetector {
             return Err(DetectError::NoPitch);
         }
 
+        // Octave-below guard (issue #82): the clamp excludes 2*tau, so an
+        // octave-below strike's 2nd partial locks onto the target and would
+        // otherwise read as a confidently in-tune note. Re-analyze the same
+        // window under f0 = target/2 vs f0 = target and reject when the
+        // sub-octave family wins decisively.
+        if self.octave_below_wins(samples, target_hz) {
+            return Err(DetectError::NoPitch);
+        }
+
         let refined_tau = self.parabolic_interpolation(&cmnd, best);
         let frequency = self.sample_rate as f32 / refined_tau;
         let frequency = self.refine_treble(samples, frequency);
@@ -534,6 +543,31 @@ impl PitchDetector {
             .refine_fundamental(samples, coarse_hz)
             .unwrap_or(coarse_hz)
     }
+
+    /// Decide whether an in-band `detect_for_target` candidate is actually the
+    /// note an octave below the target (issue #82).
+    ///
+    /// The target-clamped search cannot tell the two apart: an octave-below
+    /// note's 2nd partial is periodic at exactly the target, so it produces
+    /// the same in-band dip an in-tune fundamental does. The difference is
+    /// their fundamentals. An octave-below note has one at `target_hz / 2`;
+    /// an in-tune note has nothing there. Re-analyze the same window under the
+    /// sub-octave hypothesis and reject when that fundamental is recovered.
+    /// `locate_partials` drops a band holding only leakage (below 2% of the
+    /// strongest recovered partial), so a weak room hum cannot trip the guard
+    /// while a real sub-octave fundamental — even a weak one at ~20% of its
+    /// 2nd partial — is kept.
+    fn octave_below_wins(&self, samples: &[f32], target_hz: f32) -> bool {
+        let lower = target_hz / 2.0;
+        if lower <= 0.0 {
+            return false;
+        }
+
+        self.partial_analyzer
+            .analyze(samples, lower)
+            .iter()
+            .any(|p| p.n == 1)
+    }
 }
 
 #[cfg(test)]
@@ -579,6 +613,28 @@ mod tests {
         let ratio = freq / target;
         let edge = 2.0f32.powf(n / 12.0);
         ratio >= 1.0 / edge && ratio <= edge
+    }
+
+    /// Synthesize a detuned unison: the target string at full amplitude plus a
+    /// second string `detune_cents` sharp at ~0.6 amplitude, peak-normalized.
+    /// Real top-octave unisons beat 20-40 cents apart; the stronger string
+    /// dominates, so the detector should read the target fundamental.
+    fn detuned_unison(f0: f32, detune_cents: f32, sample_rate: u32, dur: f32) -> Vec<f32> {
+        let f2 = f0 * 2.0f32.powf(detune_cents / 1200.0);
+        let n = (sample_rate as f32 * dur) as usize;
+        let mut s = vec![0.0f32; n];
+        for (i, v) in s.iter_mut().enumerate() {
+            let t = i as f32 / sample_rate as f32;
+            *v = (2.0 * std::f32::consts::PI * f0 * t).sin()
+                + 0.6 * (2.0 * std::f32::consts::PI * f2 * t).sin();
+        }
+        let max = s.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        if max > 0.0 {
+            for v in &mut s {
+                *v /= max;
+            }
+        }
+        s
     }
 
     #[test]
@@ -1046,6 +1102,89 @@ mod tests {
             detector.detect(&vec![0.0; 4096]).unwrap_err(),
             DetectError::NoPitch
         );
+    }
+
+    #[test]
+    fn test_detect_for_target_rejects_octave_below_strike() {
+        // Issue #82: striking A3 (220 Hz) while guiding A4 (440 Hz). A3's 2nd
+        // partial is periodic at 440, so the clamped search locks onto it and
+        // would otherwise report a confidently in-tune A4 (the field test saw
+        // five real A3 strikes read ~0-5 cents on an A4 target). The guard
+        // must notice the sub-octave fundamental at 220 and report no reading.
+        //
+        // The fundamental is kept weak so the 2nd partial dominates the in-band
+        // dip — the field reality that makes this misread possible at all.
+        let signal = inharmonic_stack(
+            220.0,
+            &[(1.0, 0.2), (2.0, 1.0), (3.0, 0.4), (4.0, 0.2)],
+            0.0002,
+            0.2,
+        );
+        let detector = PitchDetector::new(SAMPLE_RATE);
+
+        // The signal really is A3: the full-range detector resolves 220 Hz.
+        let plain = detector
+            .detect(&signal)
+            .expect("full-range detector resolves A3");
+        assert!(
+            (plain.frequency - 220.0).abs() < 2.0,
+            "expected ~220 Hz, got {}",
+            plain.frequency
+        );
+
+        // Guided an octave up it must NOT report A4 as in tune.
+        assert_eq!(
+            detector.detect_for_target(&signal, 440.0).unwrap_err(),
+            DetectError::NoPitch
+        );
+    }
+
+    #[test]
+    fn test_detect_for_target_top_octave_clean_and_detuned_unison() {
+        // Issue #85: F#7-C8 must read confidently in guided mode. At C8 the
+        // integer YIN lag grid is ~165 cents/step, so the coarse estimate can
+        // be a full step off; the 60 ms register window and the 0.5 confidence
+        // gate must still pass a clean tone and a detuned unison (real top
+        // strings beat 20-40 cents apart), with spectral refinement recovering
+        // the true fundamental. Exercised at both 44.1 and 48 kHz.
+        for &sr in &[44_100_u32, 48_000_u32] {
+            for &f0 in &[2093.005_f32, 4186.009_f32] {
+                // C7, C8
+                let detector = PitchDetector::new(sr);
+
+                // (a) clean single tone
+                let clean = TestAudioSource::sine(f0, 0.1, sr);
+                let r = detector
+                    .detect_for_target(clean.samples(), f0)
+                    .unwrap_or_else(|e| panic!("clean {f0} Hz @ {sr}: {e:?}"));
+                let cents = 1200.0 * (r.frequency / f0).log2();
+                assert!(
+                    cents.abs() < 5.0,
+                    "clean {f0} Hz @ {sr}: {cents:.2} cents off"
+                );
+                assert!(
+                    r.confidence > 0.6,
+                    "clean {f0} Hz @ {sr}: confidence {}",
+                    r.confidence
+                );
+
+                // (b) detuned unison (~25 cents)
+                let uni = detuned_unison(f0, 25.0, sr, 0.1);
+                let r = detector
+                    .detect_for_target(&uni, f0)
+                    .unwrap_or_else(|e| panic!("unison {f0} Hz @ {sr}: {e:?}"));
+                let cents = 1200.0 * (r.frequency / f0).log2();
+                assert!(
+                    cents.abs() < 5.0,
+                    "unison {f0} Hz @ {sr}: {cents:.2} cents off"
+                );
+                assert!(
+                    r.confidence > 0.6,
+                    "unison {f0} Hz @ {sr}: confidence {}",
+                    r.confidence
+                );
+            }
+        }
     }
 
     #[test]

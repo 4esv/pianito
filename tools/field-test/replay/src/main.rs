@@ -10,9 +10,11 @@
 //! - `full`: `detect` (Profile mode's path, no target) + median filter
 //! - `fit_*`: Profile mode's partial capture + `fit_note_inharmonicity`
 //!
-//! Cents are against 440 ET. Env: `T0` start offset in seconds (default 0.5;
-//! use ~0.08 for fast-decaying treble), `GUIDED_ONLY=1` skips the slow
-//! full-range path.
+//! Cents are against 440 ET. Env: `T0` overrides the start offset in seconds.
+//! The default is register-aware, matching `truth.py`'s analysis window (bass
+//! 0.25 s / mid 0.15 s / treble 0.05 s), so fast-decaying treble is measured
+//! from its loud attack rather than its silent tail (issue #85).
+//! `GUIDED_ONLY=1` skips the slow full-range path.
 
 use pianito::audio::{MedianFilter, PartialAnalyzer, PitchDetector};
 use pianito::tuning::inharmonicity::fit_note_inharmonicity;
@@ -25,6 +27,21 @@ fn et(midi: u8) -> f32 {
 
 fn cents(f: f32, target: f32) -> f32 {
     1200.0 * (f / target).log2()
+}
+
+/// Register-aware default analysis start offset, mirroring `truth.py`'s
+/// window so the replay measures the same loud part of the strike the
+/// independent reference does. Issue #85: the old flat 0.5 s default started
+/// after a top-octave note's fast decay, so C7-C8 read 0% even though the
+/// detector resolves them.
+fn default_t0(midi: u8) -> f32 {
+    if midi < 48 {
+        0.25 // bass: long strings, want resolution
+    } else if midi < 84 {
+        0.15 // mid
+    } else {
+        0.05 // treble: decays fast, measure the attack
+    }
 }
 
 fn summarize(v: &[f32]) -> Value {
@@ -120,13 +137,11 @@ fn main() {
         }
         return;
     }
-    let t0: f32 = std::env::var("T0")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.5);
+    let t0_override: Option<f32> = std::env::var("T0").ok().and_then(|v| v.parse().ok());
     let guided_only = std::env::var("GUIDED_ONLY").is_ok();
     for pair in args.chunks(2) {
         let midi: u8 = pair[1].parse().expect("midi number");
+        let t0 = t0_override.unwrap_or_else(|| default_t0(midi));
         println!("{}", replay(&pair[0], midi, t0, guided_only));
     }
 }
