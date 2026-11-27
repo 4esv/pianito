@@ -102,8 +102,14 @@ every desktop distro; `sudo apt install libasound2` if it isn't).
 ### Interactive tuning
 
 ```bash
-# Start interactive tuning (opens the mode-select menu)
+# Tune now: starts a Concert session immediately (A4 = 440, Railsback stretch)
 pianito
+
+# Start Quick Tune (calibrate to the piano's current pitch, then tune)
+pianito --quick
+
+# Measure the piano first, then tune to its own stretch curve
+pianito --profile
 
 # Resume an interrupted session
 pianito --resume
@@ -111,8 +117,8 @@ pianito --resume
 # Tune to A4 = 442 Hz with a lock beep
 pianito --a4 442 --beep
 
-# Open the menu with Quick Tune preselected
-pianito --quick
+# Show the mode-select menu instead of auto-starting
+pianito --menu
 ```
 
 Flags:
@@ -121,7 +127,11 @@ Flags:
   sessions. It is also the fallback when you skip Quick Tune calibration, and
   it applies to the `reference` and `analyze` subcommands. On `--resume`, the
   session's original A4 wins.
-- `--quick` preselects Quick Tune in the mode-select menu.
+- `--quick` starts Quick Tune immediately: calibrate to the piano's current
+  pitch center, then tune.
+- `--profile` starts Profile mode immediately: measure all 88 keys, then tune.
+- `--menu` shows the mode-select menu instead of auto-starting the default
+  mode.
 - `--beep` plays a short beep the moment a string first enters the in-tune
   zone (once per strike; silence re-arms it). It needs an audio output
   device. Without one, tuning continues and the status line shows a warning.
@@ -182,8 +192,8 @@ tolerance = 5.0
 # (CLI --beep also enables this)
 beep = false
 
-# Mode preselected in the menu: "concert" or "quick"
-# (CLI --quick preselects quick)
+# Mode started by default: "concert" or "quick"
+# (CLI --quick / --profile override; --menu shows the menu instead)
 default_mode = "concert"
 
 # How stretch is applied to tuning targets: "off", "railsback", or "profile"
